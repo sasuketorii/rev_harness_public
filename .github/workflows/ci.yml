@@ -1,5 +1,8 @@
 name: Harness CI
 
+# Runs on every push to main and on pull requests. The gate tier defaults to
+# full; dispatch manually to pick a lighter tier.
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
