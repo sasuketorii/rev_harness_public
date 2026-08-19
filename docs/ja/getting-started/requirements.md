@@ -129,7 +129,36 @@ sudo apt install -y bash jq git build-essential util-linux coreutils ripgrep she
 npm install -g @anthropic-ai/claude-code @openai/codex
 ```
 
-## 8. 続行前の確認
+## 8. CIでゲートを実行する
+
+ここまでの要件は、開発マシンでハーネスを動かすためのものです。CIランナーにはさらに必要なものがあり、この差は見落としやすい――ホスト型ランナーが多くを暗黙に提供しているためです。
+
+GitHub Actionsの `ubuntu-latest` には、Python、Node、shellcheck、perl、完全なcoreutilsが既定で入っています。最小構成のコンテナイメージには入っていません。そしてどれかが欠けているとき、ゲートは「python3がありません」とは報告しません。それを必要としたステップが `127` で終了し、**欠けているツールとは何の関係もない名前のステップの失敗として表面化します**。ベースイメージがたまたま含んでいるものに頼らず、明示的に用意してください。
+
+| 必要とするもの | パッケージ |
+|---|---|
+| すべてのJSONポリシー/レジストリ検査 | `jq` |
+| skill-routing と dual-native のテスト | `ripgrep` |
+| ベンチマーク契約(ピークRSS測定) | `time` ――bashの組み込みではなく `/usr/bin/time` **バイナリ**。これが無いとベンチマークは「skipped」に劣化し、契約テストは照合すべき行を持ちません |
+| ラッパーを経由するすべての処理 | `git` ――ハーネスはgitリポジトリの外ではfail-closedします |
+| ヘルパースクリプトとスキーマ検査 | `python3` |
+| `npx` 経由のJSON Schema検証 | `nodejs`、`npm` |
+| lintステップ | `shellcheck` |
+| その他のゲートステップ | `perl`、`file`、`procps`、`coreutils` |
+
+新規のCIチェックアウトに欠けているものが、もう2つあります。
+
+- **プロジェクト識別子。** `.shared/project_id` はクローンごとの実行時状態でgitignore対象のため、クローンには決して付いてきません。ラッパーはこれが無いとfail-closedし、ラッパーを経由するすべてのゲートステップが巻き添えになります。ゲート実行前に一度だけブートストラップしてください。
+
+  ```bash
+  bash scripts/project-id.sh bootstrap <name>
+  ```
+
+- **ゲートが実際に使うbash 4以上のインタプリタ。** ゲート自身が解決しますが、検出順に頼らず `HARNESS_RELEASE_GATE_BASH` と `HARNESS_TEST_BASH` で固定できます。
+
+両方の実例がこのリポジトリにあります。`.github/workflows/ci.yml`(GitHub Actions)と `.woodpecker/check.yaml`(セルフホストのWoodpecker)です。どちらが正本ということはなく、同じゲートを実行しています。
+
+## 9. 続行前の確認
 
 ```bash
 bash scripts/harness-doctor.sh
@@ -137,7 +166,7 @@ bash scripts/harness-doctor.sh
 
 これは上記の必須要件をチェックし、何が欠けているかを報告します。非破壊的で、いつ実行しても安全です。
 
-## 9. 言語について、これ以上読み進める前に
+## 10. 言語について、これ以上読み進める前に
 
 このREADMEと `getting-started/` 配下は英語です。ハーネスの規範文書の大半——受け入れ権威である
 `docs/manual/verification-truth-matrix.md`、`docs/roles/` 配下のロール定義、

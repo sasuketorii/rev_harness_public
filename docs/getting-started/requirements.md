@@ -157,7 +157,51 @@ sudo apt install -y bash jq git build-essential util-linux coreutils ripgrep she
 npm install -g @anthropic-ai/claude-code @openai/codex
 ```
 
-## 8. Verify before you continue
+## 8. Running the gate in CI
+
+The requirements above are what the harness needs on a developer machine. A CI
+runner needs more, and the difference is easy to miss because hosted runners
+provide a lot implicitly.
+
+`ubuntu-latest` on GitHub Actions ships Python, Node, shellcheck, perl and a
+full coreutils by default. A minimal container image does not. When one of
+those is absent, the gate does not report "python3 is missing" — the step that
+needed it exits `127`, and the failure surfaces in a step whose name has
+nothing to do with the missing tool. Provision explicitly rather than relying
+on whatever the base image happens to include:
+
+| Needed by | Package |
+|---|---|
+| Every JSON policy and registry check | `jq` |
+| Skill-routing and dual-native tests | `ripgrep` |
+| Benchmark contract (peak-RSS measurement) | `time` — the `/usr/bin/time` **binary**, not the bash builtin. Without it the benchmark degrades to "skipped" and the contract test has no rows to assert against |
+| Anything shelling through the wrappers | `git` — the harness fails closed outside a git repository |
+| Helper scripts and schema checks | `python3` |
+| `npx`-based JSON-schema validation | `nodejs`, `npm` |
+| Lint steps | `shellcheck` |
+| Assorted gate steps | `perl`, `file`, `procps`, `coreutils` |
+
+Two more things a fresh CI checkout lacks:
+
+- **A project identity.** `.shared/project_id` is per-clone runtime state and is
+  gitignored, so it never arrives with a clone. The wrappers fail closed without
+  it, which takes down every gate step that shells through them. Bootstrap it
+  once before running the gate:
+
+  ```bash
+  bash scripts/project-id.sh bootstrap <name>
+  ```
+
+- **bash 4+ as the interpreter the gate actually uses.** The gate resolves one
+  itself, but you can pin it with `HARNESS_RELEASE_GATE_BASH` and
+  `HARNESS_TEST_BASH` rather than relying on detection order.
+
+Working examples of both are in this repository:
+`.github/workflows/ci.yml` (GitHub Actions) and `.woodpecker/check.yaml`
+(self-hosted Woodpecker). Neither is more authoritative than the other; they run
+the same gate.
+
+## 9. Verify before you continue
 
 ```bash
 bash scripts/harness-doctor.sh
@@ -166,7 +210,7 @@ bash scripts/harness-doctor.sh
 This checks the hard requirements above and reports what is missing. It is
 non-destructive and safe to run at any time.
 
-## 9. Language, before you clone further
+## 10. Language, before you clone further
 
 This README and everything under `getting-started/` are English. Most of the
 harness's normative documents — the acceptance authority

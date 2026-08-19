@@ -376,6 +376,16 @@ measure_step() {
   printf '%s\n' "$(utc_now)" > "$step_dir/started_at_utc.txt"
   printf '%s\n' "$started_ms" > "$step_dir/started_ms.txt"
 
+  # The measured command below runs under a non-login `bash -c`, not `bash
+  # -lc`: a login shell sources /etc/profile (and, for root, Debian's
+  # /etc/profile unconditionally rewrites PATH to a fixed system default),
+  # which silently discards the `measured_path` constructed just above —
+  # including the cargo-invocation-counting shim directory prepended to it —
+  # before the measured command ever runs. That made `--count-cargo`
+  # accounting always read zero on any root-executed minimal container. `env`
+  # already supplies the complete explicit environment this command needs, so
+  # login-shell semantics are unnecessary here and only reintroduce this class
+  # of clobbering.
   if [[ "$TIME_FORMAT" == "gnu" ]]; then
     perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!";' \
       -- /usr/bin/time -o "$time_output_file" -f '%e\t%M\t%U\t%S' \
@@ -387,7 +397,7 @@ measure_step() {
 	        HARNESS_RUNTIME_BASELINE_STDOUT_FILE="$step_dir/stdout.txt" \
 	        HARNESS_RUNTIME_BASELINE_STDERR_FILE="$step_dir/stderr.txt" \
 	        HARNESS_RUNTIME_BASELINE_STATUS_FILE="$status_file" \
-	        bash -lc 'exec >"$HARNESS_RUNTIME_BASELINE_STDOUT_FILE" 2>"$HARNESS_RUNTIME_BASELINE_STDERR_FILE"; eval "$HARNESS_RUNTIME_BASELINE_COMMAND"; rc=$?; printf "%s\n" "$rc" > "$HARNESS_RUNTIME_BASELINE_STATUS_FILE"; exit "$rc"' \
+	        bash -c 'exec >"$HARNESS_RUNTIME_BASELINE_STDOUT_FILE" 2>"$HARNESS_RUNTIME_BASELINE_STDERR_FILE"; eval "$HARNESS_RUNTIME_BASELINE_COMMAND"; rc=$?; printf "%s\n" "$rc" > "$HARNESS_RUNTIME_BASELINE_STATUS_FILE"; exit "$rc"' \
 	      >/dev/null 2>&1 &
   elif [[ "$TIME_FORMAT" == "bsd" ]]; then
     perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!";' \
@@ -400,7 +410,7 @@ measure_step() {
 	        HARNESS_RUNTIME_BASELINE_STDOUT_FILE="$step_dir/stdout.txt" \
 	        HARNESS_RUNTIME_BASELINE_STDERR_FILE="$step_dir/stderr.txt" \
 	        HARNESS_RUNTIME_BASELINE_STATUS_FILE="$status_file" \
-	        bash -lc 'exec >"$HARNESS_RUNTIME_BASELINE_STDOUT_FILE" 2>"$HARNESS_RUNTIME_BASELINE_STDERR_FILE"; eval "$HARNESS_RUNTIME_BASELINE_COMMAND"; rc=$?; printf "%s\n" "$rc" > "$HARNESS_RUNTIME_BASELINE_STATUS_FILE"; exit "$rc"' \
+	        bash -c 'exec >"$HARNESS_RUNTIME_BASELINE_STDOUT_FILE" 2>"$HARNESS_RUNTIME_BASELINE_STDERR_FILE"; eval "$HARNESS_RUNTIME_BASELINE_COMMAND"; rc=$?; printf "%s\n" "$rc" > "$HARNESS_RUNTIME_BASELINE_STATUS_FILE"; exit "$rc"' \
 	      2> "$time_output_file" &
   else
     perl -e 'use POSIX qw(setsid); setsid() or die "setsid: $!"; exec @ARGV or die "exec: $!";' \
@@ -413,7 +423,7 @@ measure_step() {
         HARNESS_RUNTIME_BASELINE_STDOUT_FILE="$step_dir/stdout.txt" \
         HARNESS_RUNTIME_BASELINE_STDERR_FILE="$step_dir/stderr.txt" \
         HARNESS_RUNTIME_BASELINE_STATUS_FILE="$status_file" \
-        bash -lc 'exec >"$HARNESS_RUNTIME_BASELINE_STDOUT_FILE" 2>"$HARNESS_RUNTIME_BASELINE_STDERR_FILE"; eval "$HARNESS_RUNTIME_BASELINE_COMMAND"; rc=$?; printf "%s\n" "$rc" > "$HARNESS_RUNTIME_BASELINE_STATUS_FILE"; exit "$rc"' \
+        bash -c 'exec >"$HARNESS_RUNTIME_BASELINE_STDOUT_FILE" 2>"$HARNESS_RUNTIME_BASELINE_STDERR_FILE"; eval "$HARNESS_RUNTIME_BASELINE_COMMAND"; rc=$?; printf "%s\n" "$rc" > "$HARNESS_RUNTIME_BASELINE_STATUS_FILE"; exit "$rc"' \
       2> "$time_output_file" &
   fi
   pid=$!

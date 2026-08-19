@@ -44,7 +44,12 @@ file_hash_or_missing() {
 mtime_or_missing() {
   local path="$1"
   if [[ -e "$path" ]]; then
-    stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null || printf 'unknown\n'
+    # GNU coreutils' `stat -f` means "filesystem status" (not "file"), and its
+    # `%m` is the mount point, not mtime — it exits 0 with unrelated (and
+    # time-varying, e.g. free-block counts) output instead of erroring, so a
+    # GNU-first `-c` probe must run before the BSD/macOS `-f '%m'` fallback or
+    # this snapshot silently captures filesystem noise instead of file mtime.
+    stat -c '%Y' "$path" 2>/dev/null || stat -f '%m' "$path" 2>/dev/null || printf 'unknown\n'
   else
     printf 'missing\n'
   fi

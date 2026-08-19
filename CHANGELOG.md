@@ -2,6 +2,44 @@
 
 Notable changes to RevHarness, from the initial public release onward.
 
+## 0.0.3
+
+Adds a second CI target and fixes three portability defects that only a
+different runner could expose.
+
+### Fixed
+
+- **`scripts/harness-runtime-baseline.sh` launched measured commands through a
+  login shell** (`bash -lc`). Running as root, Debian's `/etc/profile`
+  unconditionally overwrites `PATH`, discarding the shim directory the
+  measurement depends on. The environment is already passed explicitly via
+  `env`, so login-shell semantics were never needed.
+- **`test/integration/harness_doctor_quick_test.sh` probed file mtime with
+  `stat -f` before `stat -c`.** On GNU coreutils `-f` means *filesystem*
+  status, not format: it prints a free-space dump and exits non-zero *after*
+  writing to stdout, so the dump landed inside a command substitution and the
+  before/after comparison reported a phantom mutation. The BSD-first ordering
+  is now GNU-first.
+- **`test/unit/test-shim-log-privacy.sh` assumed a non-root user.** It creates
+  an unwritable directory with `chmod 500` and expects `mkdir` to fail; root
+  ignores permission bits, so the assertion could not hold. The test is
+  correct — the CI configuration was wrong, and now runs the gate as an
+  unprivileged user.
+
+### Added
+
+- `.woodpecker/check.yaml` — runs the same authoritative release gate on a
+  self-hosted Woodpecker runner. Keeping two CI targets is deliberate: a
+  container and a hosted VM disagree about enough (preinstalled toolchain,
+  privilege level, shell startup) that either one alone leaves blind spots.
+  All three defects above were invisible on GitHub Actions and surfaced
+  immediately on the container.
+- `docs/getting-started/requirements.md` §8 (and its Japanese mirror) — what a
+  CI runner needs beyond a developer machine. Hosted runners supply Rust,
+  Python, Node, shellcheck and a full coreutils implicitly; a minimal image
+  does not, and a missing interpreter surfaces as exit 127 in a step whose
+  name has nothing to do with it.
+
 ## 0.0.2
 
 Makes the release gate pass on Linux, and corrects two places where the

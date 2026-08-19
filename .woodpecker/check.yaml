@@ -1,0 +1,101 @@
+# Self-hosted Woodpecker verification for RevHarness.
+#
+# This runs the same authoritative gate that the GitHub Actions workflow runs
+# (test/integration/harness_release_gate.sh). Keeping both is deliberate: the
+# GitHub workflow is what a forker sees, this one is what gates pushes here.
+#
+# Two environment gaps versus ubuntu-latest (measured by reproducing this
+# exact image locally, running the gate, and reading each failing step's
+# captured stdout/stderr under .claude/tmp/harness-release-gate/runs/):
+#
+# 1. Rust toolchain. GitHub's ubuntu-latest runners ship a preinstalled
+#    rustup with a default toolchain; this bare debian image has neither
+#    `cargo` nor `rustc`. Several gate steps shell out to cargo directly
+#    (scripts/rev-harness-secret-guard.sh, the rev-harness-lease-guard Rust
+#    validator, native_reviewer_surface_smoke's `cargo test` calls,
+#    harness_runtime_baseline_test.sh's cargo-invocation accounting) — its
+#    absence showed up as rc=127/rc=1 several layers downstream rather than
+#    as a clear "cargo: command not found" at the point of use.
+#
+# 2. Non-root execution. Woodpecker runs pipeline steps as root inside the
+#    container by default; GitHub's runner user is unprivileged. Two gate
+#    steps depend on that: test/unit/test-shim-log-privacy.sh chmods a
+#    directory to 500 and expects the following mkdir to fail (root ignores
+#    the permission bits and the mkdir silently succeeds instead), and
+#    apt-get itself requires root to install packages in the first place.
+#    So: install packages as root, then drop to an unprivileged user (chosen
+#    over `sudo`/`gosu`, neither of which this image ships) for the gate
+#    itself, matching what the GitHub runner actually does.
+#
+# No deploy.yaml: this repository publishes nothing on merge.
+
+when:
+  - event: [push, pull_request, manual]
+
+steps:
+  - name: gate
+    image: debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+    environment:
+      # The gate resolves a bash >= 4 interpreter itself, but the image's
+      # /bin/bash is already 5.x; this makes the choice explicit rather than
+      # relying on detection order.
+      HARNESS_RELEASE_GATE_BASH: /bin/bash
+      HARNESS_TEST_BASH: /bin/bash
+      # Shared, world-writable so the unprivileged gate user (created below)
+      # can use the same toolchain install without re-downloading it.
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+    commands:
+      # jq            every JSON policy/registry check
+      # ripgrep       skill-routing and dual-native tests
+      # time          the /usr/bin/time binary, not the bash builtin; the
+      #               benchmark contract has no data rows without it
+      # git           the harness fails closed outside a git repository
+      # python3       helper scripts and schema checks
+      # nodejs/npm    npx-based JSON-schema validation
+      # shellcheck    lint steps
+      # perl, file, procps, coreutils   assorted gate steps
+      # curl          fetches the rustup installer
+      # gcc, libc6-dev   C linker/headers cargo needs to build native crates
+      #               (e.g. libsqlite3-sys); confirmed sufficient without
+      #               build-essential/pkg-config/libssl-dev — no crate in
+      #               harness-rust/Cargo.lock links openssl.
+      - apt-get update -qq
+      - apt-get install -y -qq --no-install-recommends
+        jq ripgrep time git ca-certificates python3 nodejs npm shellcheck
+        perl file procps coreutils curl gcc libc6-dev
+      # harness-rust/rust-toolchain.toml pins 1.87.0 (MSRV, evidence recorded
+      # in that file). rustup auto-installs the pinned toolchain the first
+      # time cargo runs inside harness-rust/ via its override file, but only
+      # once a *default* toolchain exists — with `--default-toolchain none`
+      # and no override active (e.g. a script invoking cargo from the repo
+      # root instead of harness-rust/), rustup has nothing to fall back to
+      # and errors "could not choose a version of cargo to run". Installing
+      # 1.87.0 as the explicit default sidesteps that regardless of cwd.
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+      - bash /tmp/rustup-init.sh -y --default-toolchain none --profile minimal
+      - export PATH="$CARGO_HOME/bin:$PATH" && rustup default 1.87.0
+      # Create the unprivileged user the gate itself runs as (see header).
+      # `su - gate -c` MUST NOT be used here: a login shell sources
+      # /etc/profile, which (for the deb-bookworm-slim image) unconditionally
+      # rewrites PATH — dropping the cargo toolchain we just installed. Plain
+      # `su gate -c "command"` runs a non-login, non-interactive shell that
+      # does not source /etc/profile or ~/.profile, so the PATH set here is
+      # preserved into the gate run.
+      - useradd -m -s /bin/bash gate
+      # The workspace path is assigned by the runner, not fixed. Deriving it
+      # from $PWD keeps this working under Woodpecker (/woodpecker/src/...)
+      # and under a plain `docker run -w <dir>` reproduction alike.
+      - chown -R gate:gate "$PWD"
+      - chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
+      # .shared/project_id is per-clone runtime identity and is gitignored, so
+      # a fresh checkout has none. Wrappers fail closed without it, which
+      # would take down every gate step that shells through them.
+      - >-
+        su gate -c "
+        export PATH=\"$CARGO_HOME/bin:\$PATH\" HOME=/home/gate HARNESS_RELEASE_GATE_BASH=/bin/bash HARNESS_TEST_BASH=/bin/bash;
+        git config --global --add safe.directory '$PWD' &&
+        cd '$PWD' &&
+        bash scripts/project-id.sh bootstrap rev_harness_public_ci &&
+        bash test/integration/harness_release_gate.sh --tier full
+        "

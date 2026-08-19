@@ -1,7 +1,7 @@
 {
   "schema_version": "rev-harness-version/v1",
   "harness_name": "rev_harness",
-  "harness_tag": "0.0.2",
+  "harness_tag": "0.0.3",
   "manifest_schema": "rev-harness-distribution-manifest/v1",
   "note": "harness_commit + synced_at are stamped per-adopter at sync time. This file is the harness's own version source-of-truth."
 }
