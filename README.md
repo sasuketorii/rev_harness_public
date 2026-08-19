@@ -1,7 +1,7 @@
 # RevHarness
 
-**A thin, repo-local harness that makes AI coding agents produce verifiable work
-instead of confident-sounding work.**
+**A mid-weight, repo-local harness that makes AI coding agents produce verifiable
+work instead of confident-sounding work.**
 
 日本語版: [docs/ja/README.md](docs/ja/README.md)
 
@@ -23,8 +23,14 @@ enforces four things that agent-driven development tends to lose:
   something is safe, it stops. Destructive actions require an explicit opt-in
   flag every time.
 
-It is deliberately small: shell scripts, a few JSON registries, and a three-crate
-Rust core. You can read the whole thing.
+**Mid-weight is the honest word, not a hedge.** This is not a drop-in file you
+add and forget. It is 77 shell scripts, 103 tests, a three-crate Rust core, and a
+set of conventions your agents are expected to follow. Everything in it is plain
+text you can open and change — no daemon, no service, no binary you have to trust
+— but there is real surface area here, and adopting it means taking on that
+surface. If you want something you can absorb in an afternoon, this is the wrong
+tool. If you want the acceptance model and are willing to carry the machinery
+that enforces it, this is the trade.
 
 **Scope: this is a backend harness.** It exists to produce backend and system
 code quickly and at a quality you can defend. It is not a frontend harness —

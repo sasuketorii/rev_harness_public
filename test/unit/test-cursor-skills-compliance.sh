@@ -99,8 +99,23 @@ fi
 # --- Single-source -> projection equivalence (drift gate) -------------------
 # Delegate the byte-for-byte parity enforcement (incl. .agents enumeration and
 # fail-on-drift behavior) to the canonical projection checker.
+#
+# --allow-not-installed governs only the codex-installed provider, which
+# mirrors a *machine-local* Codex CLI skills directory
+# ($CODEX_HOME/skills, default $HOME/.codex/skills) outside this repo. A
+# fresh checkout (this repo's own CI runner, or any clone that has never
+# run a Codex skill sync) has no such directory, so without this flag the
+# check fails on host state this repo does not own instead of on repo
+# content. The claude and agents providers -- the two projections that are
+# actually part of this repository's tracked tree -- are still enforced at
+# full byte-for-byte parity with no relaxation; only the codex-installed
+# provider degrades a missing directory to a logged SKIP/WARN
+# (scripts/rev-harness-skill-projection.sh reports PASS_NON_ACCEPTANCE, not
+# a silent PASS, whenever this happens) and a *stale-but-present* install
+# still fails loudly, so this does not hide real projection drift for
+# machines that do have Codex skills installed.
 if [[ -f "${PROJECTION_CHECK}" ]]; then
-  if bash "${PROJECTION_CHECK}" --check >/dev/null 2>&1; then
+  if bash "${PROJECTION_CHECK}" --check --allow-not-installed >/dev/null 2>&1; then
     assert true "rev-harness-skill-projection.sh --check passes (single-source -> projection parity, incl. .agents)"
   else
     assert false "rev-harness-skill-projection.sh --check passes (single-source -> projection parity, incl. .agents)"

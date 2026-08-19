@@ -1,6 +1,5 @@
-[DEPRECATED] scripts/claude-wrapper.sh: 2026-06-15 Agent SDK billing 分離により、default flow から除外されました (6/15 ±3日猶予)。Task tool / native subagent への移行を推奨。
-2026-07-14 までは shim として動作 (passthrough)。
-詳細: docs/agent-sdk-policy.md / docs/plans/2026-06-agent-sdk-migration/plan-v3-final.md
+[DEPRECATED] scripts/claude-wrapper.sh: cross-family calls into Claude Code consume Claude Agent SDK / Claude Code subscription usage and are excluded from the harness's default orchestration flow. Prefer the Task tool / a native Claude Code subagent instead.
+This script remains a passthrough compatibility shim; see docs/agent-sdk-policy.md for details.
 Usage:
   claude-wrapper.sh --input <file> --output <file> [options]
   claude-wrapper.sh --output <file> "prompt" [options]

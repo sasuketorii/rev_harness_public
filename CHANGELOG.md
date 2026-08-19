@@ -2,6 +2,45 @@
 
 Notable changes to RevHarness, from the initial public release onward.
 
+## 0.0.2
+
+Makes the release gate pass on Linux, and corrects two places where the
+distribution described itself inaccurately.
+
+### Fixed
+
+- **The release gate now passes on a real Linux runner.** The 0.0.1 gate scored
+  53 pass / 9 fail on ubuntu-latest. Four were genuine portability defects, not
+  environment noise:
+  - `test-path-leak-advise.sh` hardcoded `mktemp -d /private/tmp/...`, a macOS-only
+    path. On Linux the temp root came back empty and the test tried to write to
+    `/`, taking all 34 of its assertions down.
+  - `harness_benchmark_contract_test.sh` matched on `\t` inside `grep -E`, which
+    BSD grep interprets as a tab and GNU grep does not. The measured data was
+    always correct; only the assertion was unportable.
+  - The model-policy candidate check used a plain substring match, so `gpt-5.6`
+    could match inside `gpt-5.6-sol`. It is now boundary-anchored.
+  - The wrapper help golden fixtures were stale.
+  The remaining five needed tooling the runner lacks (`ripgrep`, `/usr/bin/time`)
+  or repository-external state (a bootstrapped project identity, an installed
+  Codex skill tree). Those are now provisioned in CI or skip explicitly and say
+  so, rather than failing silently or being weakened.
+
+### Changed
+
+- **"thin harness" is now "mid-weight harness."** 0.0.1 called itself thin while
+  shipping 77 scripts, 103 tests, and a three-crate Rust core. The README now
+  states the surface area up front and says plainly who this is not for, so that
+  judgement happens before adoption instead of after.
+- `test/README.md` rewritten. It documented a TypeScript testing convention,
+  complete with a `UserService` example, in a repository whose tests are entirely
+  bash. It now describes the actual house style, how to run the gate, and the
+  rule that a test which still passes against deliberately broken input is not a
+  test.
+
+Neither change under "Changed" alters behavior. Both were the distribution
+misdescribing itself.
+
 ## 0.0.1 — Initial public release
 
 The first public release of RevHarness. Everything before this point was

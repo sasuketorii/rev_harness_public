@@ -69,14 +69,23 @@ run_wrapper_expect_fail() {
 }
 
 test_policy_cli_baseline() {
-  local forbidden_candidate="gpt-5.6" # example_forbidden_model future candidate
+  # This candidate id is deliberately synthetic (not a plausible real OpenAI
+  # model name) and must stay that way: the first assertion below fetches the
+  # REAL official docs page over the network with no fixture/mock in front of
+  # it, to prove migrate correctly rejects a candidate absent from official
+  # evidence. A plausible near-future minor-version bump risks colliding with
+  # real content as the live page's model lineup advances over time, which
+  # previously produced a false PASS unrelated to this repo's code. See
+  # model-policy.sh's official_content_has_candidate_context boundary-match
+  # fix in the same change for the substring half of that bug.
+  local forbidden_candidate="gpt-5.6-rev-harness-ci-unregistered-fixture" # example_forbidden_model future candidate
   local current_official_url="https://developers.openai.com/codex/models"
   bash "$PROJECT_ROOT/scripts/model-policy.sh" validate >/dev/null
   bash "$PROJECT_ROOT/scripts/model-policy.sh" generate --check >/dev/null
   if bash "$PROJECT_ROOT/scripts/model-policy.sh" migrate --dry-run --candidate "$forbidden_candidate" \
     --official-url "$current_official_url" --checked-at 2026-04-25 \
     > "$TMP_ROOT/migrate.stdout" 2> "$TMP_ROOT/migrate.stderr"; then
-    fail "gpt-5.6 candidate migration unexpectedly passed without official exact evidence" # example_forbidden_model future candidate
+    fail "$forbidden_candidate candidate migration unexpectedly passed without official exact evidence" # example_forbidden_model future candidate
   fi
   assert_contains "official evidence lacks exact candidate id" "$TMP_ROOT/migrate.stderr"
 
@@ -86,9 +95,9 @@ test_policy_cli_baseline() {
   local fakebin="$TMP_ROOT/fakebin"
   mkdir -p "$fakebin"
   cp "$PROJECT_ROOT/.agent/registry/model_policy.json" "$near_context_policy"
-  cat > "$fakebin/curl" <<'EOF'
+  cat > "$fakebin/curl" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' 'gpt-5.6 is not available in Codex. Use gpt-5.5 for Codex CLI and SDK because it is available.' # example_forbidden_model fake official evidence
+printf '%s\n' '$forbidden_candidate is not available in Codex. Use gpt-5.5 for Codex CLI and SDK because it is available.' # example_forbidden_model fake official evidence
 EOF
   chmod +x "$fakebin/curl"
   if PATH="$fakebin:$original_path" bash "$PROJECT_ROOT/scripts/model-policy.sh" migrate --dry-run \
@@ -99,9 +108,9 @@ EOF
   fi
   assert_contains "official evidence lacks exact candidate id" "$TMP_ROOT/near-negative.stderr"
 
-  cat > "$fakebin/curl" <<'EOF'
+  cat > "$fakebin/curl" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' 'gpt-5.6 unavailable. Codex CLI and SDK are available for gpt-5.5.' # example_forbidden_model fake official evidence
+printf '%s\n' '$forbidden_candidate unavailable. Codex CLI and SDK are available for gpt-5.5.' # example_forbidden_model fake official evidence
 EOF
   chmod +x "$fakebin/curl"
   if PATH="$fakebin:$original_path" bash "$PROJECT_ROOT/scripts/model-policy.sh" migrate --dry-run \
@@ -112,9 +121,9 @@ EOF
   fi
   assert_contains "official evidence lacks exact candidate id" "$TMP_ROOT/near-unavailable.stderr"
 
-  cat > "$fakebin/curl" <<'EOF'
+  cat > "$fakebin/curl" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' 'gpt-5.6 is available for Codex CLI and SDK. Older text elsewhere says gpt-5.5 is available.' # example_forbidden_model fake official evidence
+printf '%s\n' '$forbidden_candidate is available for Codex CLI and SDK. Older text elsewhere says gpt-5.5 is available.' # example_forbidden_model fake official evidence
 EOF
   chmod +x "$fakebin/curl"
   PATH="$fakebin:$original_path" bash "$PROJECT_ROOT/scripts/model-policy.sh" migrate --dry-run \

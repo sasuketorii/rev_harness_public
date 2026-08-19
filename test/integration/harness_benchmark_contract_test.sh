@@ -131,10 +131,21 @@ run_success_case() {
   assert_file_exists "$benchmark_dir/peak_rss_kb_candidate_run01.txt"
   assert_file_exists "$benchmark_dir/peak_rss_kb_candidate_run02.txt"
 
+  # GNU grep's -E (ERE) mode does not treat the two-character sequence "\t"
+  # as a tab: it is matched literally as backslash-then-t, so a pattern
+  # written with escaped \t only ever matched on grep flavors that extend
+  # ERE with GNU/PCRE-style escapes (e.g. macOS with a Homebrew/ugrep grep
+  # ahead of BSD grep on PATH). On a stock GNU grep (every Linux CI runner)
+  # the row patterns below silently never matched, and the *data* being
+  # checked was correct the whole time. Splice in a real tab byte via
+  # bash's $'\t' instead of relying on any grep's escape handling, so the
+  # match is grep-flavor-independent.
+  local tab
+  tab="$(printf '\t')"
   assert_line_count 5 "$benchmark_dir/summary.tsv"
   assert_file_contains "$benchmark_dir/summary.tsv" $'subject\trun_index\twall_ms\tpeak_rss_kb\tfixture_sha256\tcommand_file'
-  assert_grep '^baseline\t01\t[0-9]+\t[0-9]+\t[0-9a-f]{64}\tbaseline_command\.txt$' "$benchmark_dir/summary.tsv"
-  assert_grep '^candidate\t02\t[0-9]+\t[0-9]+\t[0-9a-f]{64}\tcandidate_command\.txt$' "$benchmark_dir/summary.tsv"
+  assert_grep "^baseline${tab}01${tab}[0-9]+${tab}[0-9]+${tab}[0-9a-f]{64}${tab}baseline_command\\.txt\$" "$benchmark_dir/summary.tsv"
+  assert_grep "^candidate${tab}02${tab}[0-9]+${tab}[0-9]+${tab}[0-9a-f]{64}${tab}candidate_command\\.txt\$" "$benchmark_dir/summary.tsv"
   assert_grep '^[0-9a-f]{64}[[:space:]]+' "$benchmark_dir/fixture.sha256"
   assert_file_contains "$benchmark_dir/baseline_command.txt" "$baseline_command"
   assert_file_contains "$benchmark_dir/candidate_command.txt" "$candidate_command"

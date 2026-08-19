@@ -52,10 +52,30 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install jq
+      # jq: used pervasively for JSON policy/registry checks.
+      # ripgrep (rg): required by rev_harness_skill_routing_test.sh,
+      #   rev_harness_dual_native_check_test.sh, and self_growth_proposal_cycle_test.sh.
+      # time (the standalone /usr/bin/time binary, distinct from the bash
+      #   builtin): required by scripts/harness-benchmark.sh's peak-RSS
+      #   measurement (harness_benchmark_contract_test.sh). ubuntu-latest
+      #   does not ship it by default, so without this the benchmark script
+      #   silently degrades to "skipped" and the contract test's summary.tsv
+      #   assertions have no data rows to match.
+      - name: Install jq, ripgrep, and time
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq ripgrep time
+
+      # A fresh checkout has no .shared/project_id: it is repo-local, per-clone
+      # runtime identity and is intentionally gitignored (see .gitignore and
+      # docs/manual on project identity). Any real adopter runs this bootstrap
+      # once after cloning; the CI runner needs the same step so gate tests
+      # that shell out through the wrappers (which fail closed without an
+      # identity) have something valid to read. This mirrors
+      # scripts/init-project.sh's bootstrap_project_id step without its other
+      # first-clone side effects (template scaffolding, .gitignore edits).
+      - name: Bootstrap repo-local project identity
+        run: bash scripts/project-id.sh bootstrap rev_harness_public_ci
 
       - name: Run authoritative harness gate
         env:

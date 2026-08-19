@@ -16,7 +16,13 @@ Notes:
   - Duplicate --role values merge silently for shim chains; different values
     fail immediately with the shim source.
   - Caller overrides for profile, model, reasoning effort, sandbox, approval,
-    web-search, and workspace-expansion controls are blocked.
+    web-search, and workspace-expansion controls are blocked via CLI flags.
+  - The effective model id comes from .agent/registry/model_policy.json (current_model) by
+    default. Set REV_HARNESS_CODEX_MODEL=<model-id> to point this wrapper at a
+    different model (e.g. your own account's available model) without editing
+    the policy file. The fail-closed minimum-model gate still applies to the
+    override: a model ranked below minimum_allowed_model is rejected before
+    codex is invoked, the same as it would be for the policy default.
   - Normal harness flow is non-interactive. Session continuation is manual-only
     and requires both --manual-session and a real TTY.
   - Legacy wrapper scripts are compatibility shims that exec this script.

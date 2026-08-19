@@ -455,6 +455,17 @@ import sys
 model = os.environ["MODEL_POLICY_CANDIDATE_MODEL"]
 escaped_model = re.escape(model)
 text = re.sub(r"\s+", " ", sys.stdin.read())
+# Model ids are dash/dot-delimited tokens (e.g. gpt-5.6 vs gpt-5.6-sol): a
+# plain substring search (or a \b-based regex, since "-" and "." are already
+# non-word characters) treats "gpt-5.6" as present inside "gpt-5.6-sol".
+# Require that no id-continuation character (alnum, underscore, dot, hyphen)
+# immediately precedes or follows the match so a distinct, longer candidate
+# id on an official page can never be misread as exact evidence for a
+# shorter one.
+id_continuation = r"[A-Za-z0-9_.-]"
+candidate_boundary = re.compile(
+    rf"(?<!{id_continuation}){escaped_model}(?!{id_continuation})"
+)
 positive_runtime = re.compile(r"Codex|API|CLI|SDK|app|IDE|model picker", re.I)
 positive_availability = re.compile(
     r"\bavailable\b|availability|\bcompatible\b|compatibility|\bsupports\b|\bsupport\b|works with|"
@@ -472,15 +483,12 @@ negative_near_candidate = re.compile(
     re.I,
 )
 
-start = 0
-while True:
-    idx = text.find(model, start)
-    if idx < 0:
-        sys.exit(1)
+for m in candidate_boundary.finditer(text):
+    idx = m.start()
     window = text[max(0, idx - 500):idx + len(model) + 700]
     if positive_runtime.search(window) and positive_availability.search(window) and not negative_near_candidate.search(window):
         sys.exit(0)
-    start = idx + len(model)
+sys.exit(1)
 ' <<< "$content"
 }
 

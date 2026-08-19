@@ -1,59 +1,60 @@
 # Tests
 
-このディレクトリには、テストコードを格納します。
-**テストの品質と可読性を統一するため、以下のガイドラインとテンプレートを厳守してください。**
+Two different things live under `test/`, and confusing them is the most common
+mistake:
 
-## 1. テスト戦略 (Strategy)
-- **TDD (Test-Driven Development) 原則:** 原則として、実装コードを書く前にテストコード（失敗するテスト）を作成してください。
-- **Unit Test:** 関数・クラス単体のロジック検証（モックを積極利用）。
-- **Integration Test:** データベースやAPIを含む結合動作の検証。
-- **E2E Test:** ユーザーシナリオに基づくブラウザ/CLI操作の検証。
+- **`test/unit/` and `test/integration/` are the harness's own tests.** They are
+  harness-owned and get replaced wholesale on upgrade. Do not put your product's
+  tests here — they will be overwritten.
+- **`test/product/` is yours.** It is preserve-only; the harness never writes to
+  it. Product tests can also live next to product code, which is usually better.
 
-## 2. harness↔product 境界とファイル配置
-- **root `test/` は harness 所有:** `test/unit/` と `test/integration/` は harness 自己テストの gate であり、harness sync で上書き(managed)されます。製品テストをここに置かないでください。
-- **製品テストの配置:** 製品テストは製品コードと同居（`src/**` 配下に `*.test.*` / `*.spec.*` / `__tests__`）させるか、`test/product/**`（preserve-only / 上書きされない）に置きます。
-- **命名:** テスト対象ファイル名に `.test.` または `.spec.` を付与する（例: `user_service.ts` -> `user_service.test.ts`）。
+## Running them
 
-## 3. 記述スタイル: AAAパターン
-すべてのテストケースは **Arrange (準備) -> Act (実行) -> Assert (検証)** の3ステップで明確に区切って記述してください。
+The authoritative entry point is the release gate, not the individual files:
 
-## 4. テンプレート (`example.test.ts`)
-
-```typescript
-import { UserService } from '../src/services/UserService';
-
-describe('UserService', () => {
-  // Arrange: テスト共通の準備
-  let service: UserService;
-
-  beforeEach(() => {
-    service = new UserService();
-  });
-
-  describe('createUser()', () => {
-    it('should create a new user successfully when data is valid', async () => {
-      // Arrange
-      const input = { name: 'Test User', email: 'test@example.com' };
-
-      // Act
-      const result = await service.createUser(input);
-
-      // Assert
-      expect(result.id).toBeDefined();
-      expect(result.name).toBe(input.name);
-    });
-
-    it('should throw error when email is duplicated', async () => {
-      // Arrange
-      const input = { name: 'Duplicate User', email: 'existing@example.com' };
-      // (Mock setup for existing user would go here)
-
-      // Act & Assert
-      await expect(service.createUser(input)).rejects.toThrow('Email already exists');
-    });
-  });
-});
+```bash
+bash test/integration/harness_release_gate.sh --tier quick   # fast subset
+bash test/integration/harness_release_gate.sh --tier local   # what you run before a PR
+bash test/integration/harness_release_gate.sh --tier full    # what CI runs
 ```
 
-## 5. アーカイブ基準
-- 機能廃止やリファクタリングにより**実行されなくなったテストコード**は、`.agent/archive/test/` へ移動させてください。
+It resolves a bash 4+ interpreter itself (macOS ships 3.2, which cannot parse
+these scripts). Override with `HARNESS_RELEASE_GATE_BASH=/path/to/bash` if the
+detection picks the wrong one. Individual tests run standalone too:
+
+```bash
+bash test/unit/test-settings-merge.sh
+```
+
+Results and evidence land under `.claude/tmp/harness-release-gate/runs/`.
+
+## Writing a harness test
+
+Harness tests are bash. The house style, visible in any existing file:
+
+- `set -euo pipefail`, and resolve paths from `BASH_SOURCE` rather than assuming
+  a working directory.
+- Build fixtures in `mktemp -d` and clean them up in a `trap ... EXIT`. Several
+  harness scripts refuse to operate outside a git repository, so a temp adopter
+  root usually needs `git init -q`.
+- Print one `PASS:` or `FAIL:` line per assertion and exit non-zero on any
+  failure. The gate aggregates those lines; it does not parse anything else.
+- Assert on observable behavior — exit codes, emitted JSONL rows, files created —
+  not on log prose, which changes.
+
+**Prove the test can fail.** A test that passes against a deliberately broken
+input is not a test. When you add one, break the thing it guards, watch it go
+red, then restore. Several checks in this repository exist specifically because
+a passing test turned out to be asserting nothing.
+
+Register the test in the gate's step table so it actually runs in CI. A test
+file that nothing invokes provides no protection.
+
+## Writing product tests
+
+Use whatever your stack uses. The harness does not impose a framework on your
+code; it only cares that the check you name as acceptance evidence is
+deterministic, exits non-zero on failure, and leaves an artifact behind. See
+[the verification truth matrix](../docs/manual/verification-truth-matrix.md) for
+what makes a check citable as acceptance evidence.
