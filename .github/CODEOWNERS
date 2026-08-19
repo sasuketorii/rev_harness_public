@@ -1,0 +1,28 @@
+# Code ownership
+#
+# GitHub adds the listed owner as a reviewer on pull requests touching these
+# paths. Format: <pattern> @owner [@owner2 ...]
+#
+# The paths below are the ones where a mistake is expensive: the wrappers that
+# constrain agent invocation, the identity guard, and the gates that decide
+# whether work is accepted. If you fork this and take over maintenance, replace
+# the handle with your own.
+
+# Core wrappers and guards (high-risk changes — require strict review)
+/scripts/_canonical-guard.sh @sasuketorii
+/scripts/_shim-log.sh         @sasuketorii
+/scripts/claude-wrapper.sh    @sasuketorii
+/scripts/codex-wrapper.sh     @sasuketorii
+/scripts/codex-job.sh         @sasuketorii
+/scripts/harness-doctor.sh    @sasuketorii
+
+# Test infrastructure
+/test/integration/cross_agent_wrapper_matrix_test.sh @sasuketorii
+/test/integration/harness_release_gate.sh            @sasuketorii
+
+# Policies
+/docs/agent-sdk-policy.md @sasuketorii
+
+# CI
+/.github/workflows/ @sasuketorii
+/.github/CODEOWNERS @sasuketorii

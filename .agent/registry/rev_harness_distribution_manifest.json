@@ -1,0 +1,113 @@
+{
+  "schema_version": "rev-harness-distribution-manifest/v1",
+  "canonical": {
+    "display_name": "Revharness",
+    "machine_name": "rev_harness"
+  },
+  "legacy_aliases": [
+    "agent_base",
+    "agent-base"
+  ],
+  "source_url": "https://github.com/sasuketorii/rev_harness_public",
+  "preserve_globs_semantics": "adoption-local-preserve-only",
+  "preserve_globs": [
+    ".shared/project_id",
+    ".agent/PROJECT_CONTEXT.md",
+    ".agent/requirements.md",
+    ".agent/active",
+    ".agent/active/**",
+    ".agent/archive",
+    ".agent/archive/**",
+    ".agent/generated",
+    ".agent/generated/**",
+    ".claude/tmp",
+    ".claude/tmp/**",
+    "src",
+    "src/**",
+    "apps",
+    "apps/**",
+    "packages",
+    "packages/**",
+    "services",
+    "services/**",
+    "crates",
+    "crates/**",
+    "test/product",
+    "test/product/**"
+  ],
+  "preserve_assertions": {
+    "crates_is_product_code": "crates/** is ADOPTER-OWNED product Rust (e.g. an adopter's own service or client-project crates). It MUST be preserved and never overwritten by a harness sync. For the harness-OWNED harness-rust/crates/** runtime, see the harness_rust_distribution assertion — under the current Option X it is governed by neither this preserve entry nor any managed glob.",
+    "harness_rust_distribution": "harness-rust/crates/** is the harness-OWNED Rust runtime, distinct from adopter product crates/**. Under the current and recommended Option X, adopters build/run rev_harness's own harness-rust crate on the fly, so harness-rust/** is intentionally absent from BOTH managed_candidate_globs (never blind-copied) AND preserve_globs (not adopter-owned). Per-adopter crate-sync distribution (Option Y, fully self-contained, for client distribution) is a future track that, when adopted, adds harness-rust/** to managed_candidate_globs; tracked in task #25.",
+    "dual_lgtm_state_never_excluded": ".agent/state/dual_lgtm_state.json is I-3 dual-LGTM evidence. It is PRESERVE/evidence and MUST NEVER appear in any exclude_globs or blind-overwrite/managed set. Only runtime lock residue under .agent/state/ may be excluded."
+  },
+  "client_distribution": {
+    "exclude_globs": [
+      ".agent/active/handovers",
+      ".agent/active/handovers/**",
+      ".agent/active/prompts",
+      ".agent/active/prompts/**",
+      ".agent/active/reviews",
+      ".agent/active/reviews/**",
+      ".agent/archive",
+      ".agent/archive/**",
+      ".claude/tmp",
+      ".claude/tmp/**",
+      "workspace",
+      "workspace/**",
+      ".agent/snapshots",
+      ".agent/snapshots/**",
+      ".agent/state/*.lock",
+      ".agent/state/*.lock.d/**",
+      ".agent/state/locks/**",
+      ".agent/active/**/context.json",
+      "~/.semantic-mcp/*/semantic.db",
+      "~/.local/share/Revharness/semantic-mcp/v1/*/semantic.db",
+      "~/Library/Application Support/Revharness/semantic-mcp/v1/*/semantic.db",
+      "%LOCALAPPDATA%\\Revharness\\semantic-mcp\\v1\\*\\semantic.db"
+    ],
+    "exclude_assertion_dual_lgtm_never_excluded": ".agent/state/dual_lgtm_state.json is I-3 evidence and is intentionally ABSENT from exclude_globs. Only .agent/state/*.lock, *.lock.d/**, and locks/** runtime residue are excluded; the blanket .agent/state/** is never excluded so dual_lgtm_state.json always ships/preserves.",
+    "ship_semantic_db": false,
+    "semantic_db_regeneration": "The semantic addon is RETIRED: no semantic DB is created, shipped, or regenerated. Core setup and doctor never create semantic DB state. The semantic.db exclude_globs above are retained defensively so a re-introduced addon cannot leak adopter-local DB state through a sync."
+  },
+  "managed_candidate_globs_semantics": "TIER-1 HARNESS-OWNED: blind-overwrite/replace on sync. These are harness-authored and carry no per-adopter state. NOTE: .codex/config.toml is deliberately EXCLUDED from this set (see managed_candidate_exclude_globs + merge_globs); a blind copy would destroy the per-adopter absolute `command =` launcher path, the §9 6-tool approval allowlist, and the I-13 canonical key.",
+  "managed_candidate_globs": [
+    ".agent_rules",
+    ".agent_rules/**",
+    ".agent/registry",
+    ".agent/registry/**",
+    ".claude/commands",
+    ".claude/commands/**",
+    ".claude/hooks",
+    ".claude/hooks/**",
+    ".claude/skills",
+    ".claude/skills/**",
+    ".codex/agents",
+    ".codex/agents/**",
+    ".codex/hooks",
+    ".codex/hooks/**",
+    ".codex/hooks.json",
+    "docs",
+    "docs/**",
+    "scripts",
+    "scripts/**",
+    "test/integration",
+    "test/integration/**",
+    "test/unit",
+    "test/unit/**"
+  ],
+  "managed_candidate_exclude_globs": [
+    ".codex/config.toml",
+    ".codex/auth.json",
+    ".claude/settings.json",
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "merge_globs_semantics": "TIER-2 TEMPLATED/MERGE — never blind-overwrite. These files carry per-adopter state that a copy would clobber; the sync executor must structurally merge (e.g. TOML-structural merge for .codex/config.toml), never `cp`. .codex/config.toml specifically must preserve: (1) the per-adopter absolute `command =` launcher path, (2) the §9 6-tool approval allowlist, (3) the I-13 canonical key. .codex/config.toml is narrowed OUT of managed_candidate_globs via managed_candidate_exclude_globs and listed here instead.",
+  "merge_globs": [
+    ".codex/config.toml",
+    ".claude/settings.json",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".mcp.json"
+  ]
+}

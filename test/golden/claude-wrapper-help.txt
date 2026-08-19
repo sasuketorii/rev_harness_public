@@ -1,0 +1,48 @@
+[DEPRECATED] scripts/claude-wrapper.sh: 2026-06-15 Agent SDK billing 分離により、default flow から除外されました (6/15 ±3日猶予)。Task tool / native subagent への移行を推奨。
+2026-07-14 までは shim として動作 (passthrough)。
+詳細: docs/agent-sdk-policy.md / docs/plans/2026-06-agent-sdk-migration/plan-v3-final.md
+Usage:
+  claude-wrapper.sh --input <file> --output <file> [options]
+  claude-wrapper.sh --output <file> "prompt" [options]
+  claude-wrapper.sh --manual-session --resume <session-id> --output <file> [options] [prompt]
+
+Required:
+  --output <file>          Output file path
+
+Input (one of):
+  --input <file>           Read prompt from file
+  "prompt"                 Direct prompt string
+
+Wrapper options:
+  --model <opus|sonnet>    Model alias (default: opus)
+  --effort <level>         Effort level: low|medium|high|xhigh (default: medium)
+  --mode <mode>            Mode: delegate-text|orchestrator-full (default: delegate-text)
+  --timeout <seconds>      Timeout in seconds (default: disabled, 0 disables)
+  --implementation-workspace <workspace/task>
+                            Writable target for delegated implementation work; must be under workspace/
+  --resume <session-id>    Resume an existing session (manual TTY-only)
+  --session-id <uuid>      Explicit session id for new/forked sessions
+  --fork-session           Use with --resume to fork into a new session (manual TTY-only)
+  --manual-session         Allow session continuation only from a real TTY
+  --help                   Show this help message
+
+Safe passthrough options:
+  --system-prompt <text>
+  --append-system-prompt <text>
+  --allowed-tools <tools>
+  --disallowed-tools <tools>
+  --tools <tools>
+  --max-budget-usd <amount>
+  --output-format <format>
+  --add-dir <dir>
+  --agent <agent>
+  --agents <json>
+  --mcp-config <configs>
+  --settings <file-or-json>
+  --strict-mcp-config
+  --no-session-persistence
+  --bare                  Rejected in subscription-only wrapper mode
+
+Fixed by wrapper:
+  --print
+  --permission-mode bypassPermissions

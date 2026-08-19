@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revharness.local/schemas/wrapper_events.jsonl.schema.json",
+  "title": "wrapper_events.jsonl row",
+  "description": "One row per wrapper-level structured event. Covers bg-job reaper rows, stash-gc rows, and any other wrapper-emitted lifecycle event. Polymorphic on the 'event' discriminator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "event"],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event": {
+      "type": "string",
+      "enum": [
+        "bg_reap",
+        "stash_gc",
+        "wrapper_start",
+        "wrapper_exit",
+        "hook_dispatch"
+      ]
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pgid": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "class": {
+      "type": "string",
+      "enum": [
+        "owner_registered",
+        "orphan_unowned",
+        "foreign_outside_pgid"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "enum": ["sigterm", "sigkill", "noop", "audit_only"]
+    },
+    "owner_agent_id": {
+      "type": ["string", "null"]
+    },
+    "agent_family": {
+      "type": "string",
+      "enum": ["claude", "codex", "unknown"]
+    },
+    "repo": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["dry_run", "apply"]
+    },
+    "bail_prefix": {
+      "type": "string",
+      "minLength": 1
+    },
+    "max_age_days": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "candidate_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "deleted_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "preserved_latest": {
+      "type": ["string", "null"]
+    },
+    "exit_code": {
+      "type": "integer"
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "wrapper": {
+      "type": "string",
+      "enum": ["claude", "codex", "cursor"]
+    }
+  }
+}

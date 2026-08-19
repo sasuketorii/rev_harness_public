@@ -1,0 +1,2433 @@
+#!/bin/bash
+set -euo pipefail
+
+# Review queue backend contract:
+# - Sole backend: core JSONL at
+#   `.agent/state/review_queue/events.jsonl`, protected by a repo-local
+#   `mkdir` lock directory. This keeps queue authority inspectable and
+#   diffable, avoids sqlite3 availability assumptions, and keeps
+#   semantic-mcp/tree-sitter/cargo entirely out of the queue write path.
+# - There is no `semantic` REVHARNESS_REVIEW_QUEUE_BACKEND in this harness
+#   (no semantic-mcp crate/queue exists). Only the `core` backend exists.
+# - Any non-`core` value of `REVHARNESS_REVIEW_QUEUE_BACKEND` (including the
+#   removed `semantic` value) fails closed.
+# - Public core identifiers preserve the legacy backend validation class:
+#   `source` is `[A-Za-z0-9_-]` up to 32 chars, lease owners are
+#   `[A-Za-z0-9-]` up to 128 chars, and lease run IDs are
+#   `[A-Za-z0-9._:-]` up to 128 chars.
+# - Re-enqueue while a file is actively leased records the enqueue event but
+#   keeps the leased state and owner so the current lease can complete.
+# - Core stores `lease_run_id` in internal reducer events/state, but public
+#   item objects intentionally omit it to match the legacy Rust `QueueItem`
+#   shape. Lease responses keep top-level `lease_run_id`; empty leases echo the
+#   requested run id.
+# - Finalize `--expected-file` inputs use the same repo-relative normalization
+#   as enqueue before matching and before append-only event emission.
+# - The core lock is a `mkdir` lock with `pid` metadata. A lock older than
+#   `REVHARNESS_REVIEW_QUEUE_LOCK_TTL_SECONDS` (default 30s) is reclaimed only
+#   when no recorded PID is live, or when no valid PID was recorded.
+# - Optional test/ops overrides:
+#   `REVHARNESS_REVIEW_QUEUE_STATE_DIR`, `REVHARNESS_REVIEW_QUEUE_METRICS`.
+# - Compatibility export remains caller-controlled through `--export-json`;
+#   hook ingress still passes `.claude/tmp/review_queue.json`.
+#
+# Metrics schema (`.agent/metrics/review_queue_events.jsonl`, append-only):
+# {"schema_version":1,"ts":"RFC3339Z","event":"enqueue-ok|enqueue-skipped|backend-unavailable|lock-reclaimed","backend":"core|unknown","project_id":"...","file_path":"repo/relative/or-empty","source":"...","reason":"...","fail_behavior":"fail-closed"}
+# Rows intentionally contain repo-relative paths only; absolute state/host paths
+# are not emitted.
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  review-queue.sh enqueue --file-path PATH [--source SOURCE] [--repo-root PATH] [--export-json PATH]' \
+    '  review-queue.sh lease --lease-run-id ID [--lease-seconds SECONDS] [--repo-root PATH]' \
+    '  review-queue.sh drain --lease-run-id ID [--lease-seconds SECONDS] [--repo-root PATH]' \
+    '  review-queue.sh complete --lease-owner OWNER --expected-file PATH [--expected-file PATH ...] [--lease-run-id ID] [--project-id ID] [--repo-root PATH]' \
+    '  review-queue.sh requeue --lease-owner OWNER --expected-file PATH [--expected-file PATH ...] [--lease-run-id ID] --error MESSAGE [--project-id ID] [--repo-root PATH]' \
+    '  review-queue.sh export-json --output PATH [--project-id ID] [--repo-root PATH]'
+}
+
+die() {
+  printf 'review-queue.sh: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'review-queue.sh: WARN: %s\n' "$*" >&2
+}
+
+TRUSTED_RUNTIME_PASSTHROUGH_ENV_NAMES=(
+  LANG
+  LC_ALL
+  LC_CTYPE
+  TMPDIR
+  TMP
+  TEMP
+  TERM
+  CI
+  NO_COLOR
+  FORCE_COLOR
+  COLORTERM
+)
+TRUSTED_RUNTIME_ENV_ASSIGNMENTS=()
+# Resolved-once trusted jq binary. Populated by ensure_jq() before any jq use on
+# every entrypoint (public commands AND __internal-* subcommands). All jq call
+# sites invoke "$RESOLVED_JQ" so an attacker-controlled PATH jq can never run via
+# this queue helper.
+RESOLVED_JQ=""
+# Trusted absolute directories that may supply `jq`, scanned in this fixed order.
+# Resolution deliberately ignores inherited PATH ordering so an attacker cannot
+# inject a binary by reordering PATH. This DELIBERATELY does NOT reuse
+# trusted_system_binary_path (which only scans /usr/bin and /bin to guard
+# id/runtime resolution): jq on Homebrew/Apple-Silicon usually lives only in
+# /opt/homebrew/bin, so this dedicated jq allowlist is Homebrew-inclusive and
+# mirrors the merged hook resolver in .claude/hooks/codex-review-hook.sh.
+TRUSTED_JQ_DIRS=(
+  /usr/bin
+  /bin
+  /usr/local/bin
+  /opt/homebrew/bin
+  /opt/local/bin
+)
+# Trusted prefix roots a trusted-dir `jq` symlink may legitimately resolve into
+# (package managers place the real binary in a versioned install tree exposed via
+# a symlink in a trusted bin dir). Anything resolving outside these is rejected.
+TRUSTED_JQ_PREFIXES=(
+  /usr
+  /bin
+  /usr/local
+  /opt/homebrew
+  /opt/local
+)
+RUST_WORKSPACE_RESOLUTION_STATE=""
+RUST_WORKSPACE_RESOLUTION_ROOT=""
+RUST_WORKSPACE_RESOLUTION_ERROR=""
+
+script_dir() {
+  local source_path="${BASH_SOURCE[0]}"
+  case "$source_path" in
+    */*)
+      cd "${source_path%/*}" && pwd -P
+      ;;
+    *)
+      pwd -P
+      ;;
+  esac
+}
+
+canonicalize_dir() {
+  local dir_path="${1:-}"
+  [[ -n "$dir_path" ]] || die "directory path is required"
+  [[ -d "$dir_path" ]] || die "directory does not exist: $dir_path"
+  (
+    cd "$dir_path" && pwd -P
+  )
+}
+
+resolve_existing_path() {
+  local path_value="${1:-}"
+  [[ -n "$path_value" ]] || die "path is required"
+
+  local parent_dir=""
+  local base_name=""
+  local canonical_parent=""
+
+  parent_dir="$(path_parent_dir "$path_value")"
+  base_name="$(path_leaf_name "$path_value")"
+  canonical_parent="$(canonicalize_dir "$parent_dir")"
+
+  [[ -e "$canonical_parent/$base_name" ]] || die "path does not exist: $path_value"
+  printf '%s/%s\n' "$canonical_parent" "$base_name"
+}
+
+path_within_root() {
+  local candidate="${1:-}"
+  local root="${2:-}"
+  [[ -n "$candidate" && -n "$root" ]] || return 1
+  [[ "$candidate" == "$root" || "$candidate" == "$root/"* ]]
+}
+
+assert_no_symlink_components() {
+  local root="${1:-}"
+  local path_value="${2:-}"
+  [[ -n "$root" && -n "$path_value" ]] || die "root and path are required"
+
+  local normalized_root=""
+  local relative_path=""
+  local current=""
+  local component=""
+  local -a path_components=()
+
+  normalized_root="$(canonicalize_dir "$root")"
+  [[ "$path_value" == "$normalized_root" || "$path_value" == "$normalized_root/"* ]] \
+    || die "path escapes repo-local identity root: $path_value"
+
+  relative_path="${path_value#"$normalized_root"}"
+  relative_path="${relative_path#/}"
+
+  current="$normalized_root"
+  IFS='/' read -r -a path_components < <(printf '%s\n' "$relative_path")
+  for component in "${path_components[@]}"; do
+    [[ -n "$component" ]] || continue
+    [[ "$component" != "." && "$component" != ".." ]] \
+      || die "path must not contain traversal components: $path_value"
+    current="$current/$component"
+    if [[ -L "$current" ]]; then
+      die "path contains symlink component: $current"
+    fi
+  done
+}
+
+trim_trailing_slash() {
+  local path_value="${1:-}"
+  while [[ "$path_value" != "/" && "$path_value" == */ ]]; do
+    path_value="${path_value%/}"
+  done
+  printf '%s\n' "$path_value"
+}
+
+trim_ascii_whitespace() {
+  local value="${1-}"
+  value="${value#"${value%%[!$' \t\r\n']*}"}"
+  value="${value%"${value##*[!$' \t\r\n']}"}"
+  printf '%s\n' "$value"
+}
+
+path_parent_dir() {
+  local path_value="${1:-}"
+  local parent_dir=""
+
+  [[ -n "$path_value" ]] || die "path is required"
+  path_value="$(trim_trailing_slash "$path_value")"
+  if [[ "$path_value" == "/" ]]; then
+    printf '/\n'
+    return 0
+  fi
+
+  case "$path_value" in
+    */*)
+      parent_dir="${path_value%/*}"
+      [[ -n "$parent_dir" ]] || parent_dir="/"
+      printf '%s\n' "$parent_dir"
+      ;;
+    *)
+      printf '.\n'
+      ;;
+  esac
+}
+
+path_leaf_name() {
+  local path_value="${1:-}"
+
+  [[ -n "$path_value" ]] || die "path is required"
+  path_value="$(trim_trailing_slash "$path_value")"
+  if [[ "$path_value" == "/" ]]; then
+    printf '/\n'
+    return 0
+  fi
+
+  case "$path_value" in
+    */*)
+      printf '%s\n' "${path_value##*/}"
+      ;;
+    *)
+      printf '%s\n' "$path_value"
+      ;;
+  esac
+}
+
+canonicalize_queue_enqueue_file_path() {
+  local repo_root="${1:-}"
+  local raw_path="${2:-}"
+  local normalized_root=""
+  local normalized_path=""
+  local current_path=""
+  local component=""
+  local candidate=""
+  local canonical_relative=""
+  local -a components=()
+
+  [[ -n "$repo_root" ]] || die "repo root is required"
+  [[ -n "$raw_path" ]] || die "file_path must not be empty"
+  [[ ! "$raw_path" =~ [[:cntrl:]] ]] || die "file_path must not contain control bytes"
+
+  normalized_root="$(canonicalize_dir "$repo_root")" || die "repo root must exist: $repo_root"
+  normalized_path="$(trim_ascii_whitespace "$raw_path")"
+  [[ -n "$normalized_path" ]] || die "file_path must not be empty"
+
+  case "$normalized_path" in
+    /*|[A-Za-z]:/*)
+      die "file_path must be repo-relative"
+      ;;
+  esac
+
+  normalized_path="${normalized_path//\\//}"
+  while [[ "$normalized_path" == ./* ]]; do
+    normalized_path="${normalized_path#./}"
+  done
+  normalized_path="$(trim_trailing_slash "$normalized_path")"
+  [[ -n "$normalized_path" ]] || die "file_path must not be empty"
+
+  current_path="$normalized_root"
+  IFS='/' read -r -a components < <(printf '%s\n' "$normalized_path")
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || continue
+    case "$component" in
+      .)
+        continue
+        ;;
+      ..)
+        die "file_path must not contain traversal components: $raw_path"
+        ;;
+      -*)
+        die "file_path must not contain leading-dash components: $raw_path"
+        ;;
+    esac
+    if [[ -n "$canonical_relative" ]]; then
+      canonical_relative="${canonical_relative}/"
+    fi
+    canonical_relative="${canonical_relative}${component}"
+    current_path="${current_path}/${component}"
+    if [[ -L "$current_path" ]]; then
+      die "file_path resolves through a symlinked path: $raw_path"
+    fi
+  done
+
+  [[ -n "$canonical_relative" ]] || die "file_path must not be empty"
+  candidate="${normalized_root}/${canonical_relative}"
+  path_within_root "$candidate" "$normalized_root" \
+    || die "file_path resolves outside repo_root: $raw_path"
+
+  printf '%s\n' "$canonical_relative"
+}
+
+trusted_system_binary_path() {
+  local binary_name="${1:-}"
+  local candidate=""
+
+  [[ "$binary_name" =~ ^[A-Za-z0-9._+-]+$ ]] || die "trusted system binary name is invalid: $binary_name"
+
+  for candidate in "/usr/bin/$binary_name" "/bin/$binary_name"; do
+    [[ -x "$candidate" && -f "$candidate" && ! -L "$candidate" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  return 1
+}
+
+canonicalize_existing_file() {
+  # Resolve an existing regular file to its canonical absolute path by
+  # canonicalizing the parent directory (cd/pwd -P resolves all symlink
+  # components) and re-appending the leaf, then resolving any leaf symlink hops.
+  # Fails if the parent is not a real directory or the leaf is not a regular,
+  # non-symlink executable after resolution. Mirrors the merged hook resolver.
+  local target="${1:-}"
+  local parent_dir=""
+  local leaf=""
+  local canonical_parent=""
+  local canonical_path=""
+
+  [[ -n "$target" && "$target" == /* ]] || return 1
+  parent_dir="${target%/*}"
+  [[ -n "$parent_dir" ]] || parent_dir="/"
+  leaf="${target##*/}"
+  [[ -n "$leaf" ]] || return 1
+
+  canonical_parent="$(cd "$parent_dir" 2>/dev/null && pwd -P)" || return 1
+  if [[ "$canonical_parent" == "/" ]]; then
+    canonical_path="/$leaf"
+  else
+    canonical_path="$canonical_parent/$leaf"
+  fi
+
+  while [[ -L "$canonical_path" ]]; do
+    local link_target=""
+    link_target="$(/usr/bin/readlink "$canonical_path")" || return 1
+    if [[ "$link_target" != /* ]]; then
+      link_target="${canonical_path%/*}/$link_target"
+    fi
+    local next_parent="${link_target%/*}"
+    [[ -n "$next_parent" ]] || next_parent="/"
+    local next_leaf="${link_target##*/}"
+    canonical_parent="$(cd "$next_parent" 2>/dev/null && pwd -P)" || return 1
+    if [[ "$canonical_parent" == "/" ]]; then
+      canonical_path="/$next_leaf"
+    else
+      canonical_path="$canonical_parent/$next_leaf"
+    fi
+  done
+
+  [[ -f "$canonical_path" && -x "$canonical_path" && ! -L "$canonical_path" ]] || return 1
+  printf '%s\n' "$canonical_path"
+}
+
+canonical_jq_target_is_trusted() {
+  # The canonical jq target must live under a trusted prefix root, must not be
+  # under the repo root, and must not sit in a world-writable directory
+  # (drop-in shim / tampering protection). Mirrors the merged hook resolver.
+  local canonical_path="${1:-}"
+  local repo_root_dir="${2:-}"
+  local prefix=""
+  local matched=0
+  local canonical_repo_root=""
+  local target_dir=""
+  local perms=""
+
+  [[ -n "$canonical_path" && "$canonical_path" == /* ]] || return 1
+
+  for prefix in "${TRUSTED_JQ_PREFIXES[@]}"; do
+    if [[ "$canonical_path" == "$prefix" || "$canonical_path" == "$prefix/"* ]]; then
+      matched=1
+      break
+    fi
+  done
+  (( matched == 1 )) || return 1
+
+  # Never trust a jq that resolves inside the repo tree.
+  if [[ -n "$repo_root_dir" ]]; then
+    canonical_repo_root="$(cd "$repo_root_dir" 2>/dev/null && pwd -P)" || canonical_repo_root="$repo_root_dir"
+    if [[ "$canonical_path" == "$canonical_repo_root" || "$canonical_path" == "$canonical_repo_root/"* ]]; then
+      return 1
+    fi
+  fi
+
+  # Reject world-writable hosting directories (inspect the "other" write bit from
+  # the mode string rather than -w, which only reflects the caller's access).
+  target_dir="${canonical_path%/*}"
+  [[ -n "$target_dir" ]] || target_dir="/"
+  perms="$(/bin/ls -ld "$target_dir" 2>/dev/null | cut -c1-10)"
+  [[ -n "$perms" ]] || return 1
+  [[ "${perms:8:1}" != "w" ]] || return 1
+
+  return 0
+}
+
+resolve_jq() {
+  # Resolve jq from the trusted allowlist only. Ignores inherited PATH and any
+  # JQ_BIN env. Returns the canonical absolute path on stdout, or fails closed.
+  local repo_root_dir="${1:-}"
+  local dir=""
+  local candidate=""
+  local canonical_path=""
+
+  for dir in "${TRUSTED_JQ_DIRS[@]}"; do
+    candidate="$dir/jq"
+    [[ -x "$candidate" && ! -d "$candidate" ]] || continue
+    canonical_path="$(canonicalize_existing_file "$candidate")" || continue
+    canonical_jq_target_is_trusted "$canonical_path" "$repo_root_dir" || continue
+    printf '%s\n' "$canonical_path"
+    return 0
+  done
+
+  return 1
+}
+
+ensure_jq() {
+  # Populate RESOLVED_JQ exactly once from a trusted location. Called before any
+  # jq use on every entrypoint. Fail-closed if no trusted jq is found so a
+  # hostile PATH jq can never execute via this helper.
+  [[ -z "$RESOLVED_JQ" ]] || return 0
+  local repo_root_dir=""
+  repo_root_dir="$(cd "$(script_dir)/.." 2>/dev/null && pwd -P)" || repo_root_dir=""
+  RESOLVED_JQ="$(resolve_jq "$repo_root_dir")" \
+    || die "no trusted jq found in: ${TRUSTED_JQ_DIRS[*]} (refusing to run jq from an untrusted PATH)"
+}
+
+trusted_runtime_owner_user() {
+  local user_name=""
+  local id_bin=""
+
+  id_bin="$(trusted_system_binary_path id || true)"
+  [[ -n "$id_bin" ]] || die "trusted system id binary is required to determine runtime owner user"
+  user_name="$("$id_bin" -un 2>/dev/null)" || die "failed to determine runtime owner user"
+  [[ "$user_name" =~ ^[A-Za-z0-9._-]+$ ]] || die "runtime owner user is invalid: $user_name"
+  printf '%s\n' "$user_name"
+}
+
+trusted_runtime_owner_home() {
+  local user_name=""
+  local owner_home=""
+
+  user_name="$(trusted_runtime_owner_user)"
+  eval "owner_home=~${user_name}"
+  [[ -n "$owner_home" && "$owner_home" == /* ]] || die "failed to resolve runtime owner home for ${user_name}"
+  canonicalize_dir "$owner_home"
+}
+
+resolve_node_runtime_home() {
+  trusted_runtime_owner_home
+}
+
+trusted_runtime_dir_patterns() {
+  local home_dir=""
+  home_dir="$(trim_trailing_slash "$(trusted_runtime_owner_home)")"
+
+  printf '%s\n' "/usr/bin"
+  printf '%s\n' "/bin"
+  printf '%s\n' "/usr/local/bin"
+  printf '%s\n' "/opt/homebrew/bin"
+  printf '%s\n' "/Applications/Codex.app/Contents/Resources"
+
+  printf '%s\n' "$home_dir/.cargo/bin"
+  printf '%s\n' "$home_dir/.rustup/toolchains/*/bin"
+  printf '%s\n' "$home_dir/.local/bin"
+  printf '%s\n' "$home_dir/.local/share/mise/shims"
+  printf '%s\n' "$home_dir/.local/share/mise/installs/*/*/bin"
+  printf '%s\n' "$home_dir/.mise/shims"
+  printf '%s\n' "$home_dir/.mise/installs/*/*/bin"
+}
+
+runtime_path_matches_trusted_pattern() {
+  local candidate_path="${1:-}"
+  local pattern=""
+
+  while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] || continue
+    # shellcheck disable=SC2053
+    if [[ "$candidate_path" == $pattern ]]; then
+      return 0
+    fi
+  done < <(trusted_runtime_dir_patterns)
+
+  return 1
+}
+
+runtime_binary_dir() {
+  local binary_path="${1:-}"
+  [[ -n "$binary_path" && "$binary_path" == */* ]] || return 1
+  printf '%s\n' "${binary_path%/*}"
+}
+
+is_trusted_runtime_binary() {
+  local binary_path="${1:-}"
+  local binary_dir=""
+  local canonical_dir=""
+  local normalized_path=""
+  local canonical_path=""
+
+  [[ "$binary_path" == /* && -x "$binary_path" && -f "$binary_path" && ! -L "$binary_path" ]] || return 1
+  binary_dir="$(runtime_binary_dir "$binary_path")" || return 1
+  canonical_dir="$(canonical_safe_runtime_path_entry "$binary_dir")" || return 1
+  normalized_path="$(trim_trailing_slash "$binary_path")"
+  canonical_path="${canonical_dir}/${binary_path##*/}"
+  [[ "$normalized_path" == "$canonical_path" ]] || return 1
+}
+
+is_likely_runtime_shim() {
+  local binary_name="${1:-}"
+  local candidate="${2:-}"
+  case "$candidate" in
+    */.local/share/mise/shims/"$binary_name"|*/.mise/shims/"$binary_name")
+      return 0
+      ;;
+    */.cargo/bin/cargo)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_mise_binary_from_shim() {
+  local shim_path="${1:-}"
+  local binary_name="${2:-}"
+  local path_value="${3:-$PATH}"
+  local manager_home=""
+  local data_root=""
+  local preferred_mise_bin=""
+  local mise_bin=""
+  local resolved=""
+  local sanitized_path=""
+  local path_dir=""
+  local candidate=""
+
+  case "$shim_path" in
+    */.local/share/mise/shims/"$binary_name"|*/.mise/shims/"$binary_name")
+      data_root="${shim_path%/shims/"$binary_name"}"
+      case "$data_root" in
+        */.local/share/mise)
+          manager_home="${data_root%/.local/share/mise}"
+          ;;
+        */.mise)
+          manager_home="${data_root%/.mise}"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  preferred_mise_bin="${manager_home}/.local/bin/mise"
+  mise_bin="$preferred_mise_bin"
+  sanitized_path="$(sanitize_runtime_path "$path_value")"
+
+  if [[ -L "$mise_bin" ]] || ! is_trusted_runtime_binary "$mise_bin"; then
+    mise_bin=""
+    local IFS=':'
+    local -a path_entries=()
+    if [[ -n "$sanitized_path" ]]; then
+      # shellcheck disable=SC2206
+      path_entries=($sanitized_path)
+    fi
+    for path_dir in "${path_entries[@]}"; do
+      candidate="${path_dir%/}/mise"
+      [[ -x "$candidate" && ! -d "$candidate" ]] || continue
+      if [[ "$candidate" == "$preferred_mise_bin" && -L "$candidate" ]]; then
+        continue
+      fi
+      case "$candidate" in
+        */shims/mise)
+          continue
+          ;;
+      esac
+      is_trusted_runtime_binary "$candidate" || continue
+      mise_bin="$candidate"
+      break
+    done
+  fi
+
+  [[ -x "$mise_bin" && ! -d "$mise_bin" ]] || return 1
+
+  resolved="$(
+    HOME="$manager_home" \
+    MISE_DATA_DIR="$data_root" \
+    PATH="$sanitized_path" \
+    "$mise_bin" which "$binary_name" 2>/dev/null
+  )" || return 1
+
+  is_trusted_runtime_binary "$resolved" || return 1
+  is_likely_runtime_shim "$binary_name" "$resolved" && return 1
+  printf '%s\n' "$resolved"
+}
+
+resolve_rustup_cargo_from_proxy() {
+  local cargo_path="${1:-}"
+  local path_value="${2:-$PATH}"
+  local manager_home=""
+  local cargo_home=""
+  local rustup_home=""
+  local rustup_bin=""
+  local resolved=""
+
+  case "$cargo_path" in
+    */.cargo/bin/cargo)
+      manager_home="${cargo_path%/.cargo/bin/cargo}"
+      cargo_home="${manager_home}/.cargo"
+      rustup_home="${manager_home}/.rustup"
+      rustup_bin="${cargo_home}/bin/rustup"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  [[ -x "$rustup_bin" && ! -d "$rustup_bin" ]] || return 1
+  is_trusted_runtime_binary "$rustup_bin" >/dev/null || return 1
+
+  resolved="$(
+    HOME="$manager_home" \
+    CARGO_HOME="$cargo_home" \
+    RUSTUP_HOME="$rustup_home" \
+    PATH="$(sanitize_runtime_path "$path_value")" \
+    "$rustup_bin" which cargo 2>/dev/null
+  )" || return 1
+
+  is_trusted_runtime_binary "$resolved" || return 1
+  is_likely_runtime_shim cargo "$resolved" && return 1
+  printf '%s\n' "$resolved"
+}
+
+resolve_rust_toolchain_bin() {
+  local cargo_path="${1:-}"
+  case "$cargo_path" in
+    */.rustup/toolchains/*/bin/cargo)
+      printf '%s\n' "${cargo_path%/cargo}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_cargo_runtime_home() {
+  local cargo_path="${1:-}"
+  is_trusted_runtime_binary "$cargo_path" || return 1
+  trusted_runtime_owner_home
+}
+
+canonical_safe_runtime_path_entry() {
+  local path_entry="${1:-}"
+  local normalized_path=""
+  local canonical_path=""
+
+  [[ -n "$path_entry" ]] || return 1
+  [[ "$path_entry" == /* ]] || return 1
+  if ! canonical_path="$(canonicalize_dir "$path_entry" 2>/dev/null)"; then
+    return 1
+  fi
+
+  normalized_path="$(trim_trailing_slash "$path_entry")"
+  canonical_path="$(trim_trailing_slash "$canonical_path")"
+  [[ "$normalized_path" == "$canonical_path" ]] || return 1
+  runtime_path_matches_trusted_pattern "$canonical_path" || return 1
+  printf '%s\n' "$canonical_path"
+}
+
+is_safe_runtime_path_entry() {
+  canonical_safe_runtime_path_entry "${1:-}" >/dev/null
+}
+
+sanitize_runtime_path() {
+  local path_value="${1:-$PATH}"
+  local remaining="${path_value}:"
+  local path_entry=""
+  local canonical_entry=""
+  local -a safe_entries=()
+  local joined=""
+  local existing_entry=""
+
+  while [[ "$remaining" == *:* ]]; do
+    path_entry="${remaining%%:*}"
+    remaining="${remaining#*:}"
+    canonical_entry="$(canonical_safe_runtime_path_entry "$path_entry" 2>/dev/null || true)"
+    [[ -n "$canonical_entry" ]] || continue
+
+    if [[ "${#safe_entries[@]}" -gt 0 ]]; then
+      for existing_entry in "${safe_entries[@]}"; do
+        [[ "$existing_entry" != "$canonical_entry" ]] || continue 2
+      done
+    fi
+
+    safe_entries+=("$canonical_entry")
+  done
+
+  if [[ "${#safe_entries[@]}" -gt 0 ]]; then
+    for path_entry in "${safe_entries[@]}"; do
+      if [[ -n "$joined" ]]; then
+        joined="${joined}:"
+      fi
+      joined="${joined}${path_entry}"
+    done
+  fi
+
+  printf '%s\n' "$joined"
+}
+
+first_runtime_candidate() {
+  local binary_name="${1:-}"
+  local path_value="${2:-$PATH}"
+  local remaining="${path_value}:"
+  local path_dir=""
+  local candidate=""
+  local canonical_dir=""
+
+  while [[ "$remaining" == *:* ]]; do
+    path_dir="${remaining%%:*}"
+    remaining="${remaining#*:}"
+
+    case "$path_dir" in
+      ""|"." )
+        continue
+        ;;
+    esac
+    [[ "$path_dir" == /* ]] || continue
+
+    candidate="${path_dir%/}/${binary_name}"
+    [[ -x "$candidate" && ! -d "$candidate" ]] || continue
+
+    canonical_dir="$(canonical_safe_runtime_path_entry "$path_dir" 2>/dev/null || true)"
+    [[ -n "$canonical_dir" ]] || return 1
+
+    printf '%s\n' "${canonical_dir}/${binary_name}"
+    return 0
+  done
+
+  return 1
+}
+
+first_runtime_candidate_after() {
+  local binary_name="${1:-}"
+  local path_value="${2:-$PATH}"
+  local after_dir="${3:-}"
+  local remaining=""
+  local path_dir=""
+  local candidate=""
+  local canonical_dir=""
+  local seen_after=0
+
+  [[ -n "$after_dir" ]] || return 1
+  remaining="$(sanitize_runtime_path "$path_value"):"
+
+  while [[ "$remaining" == *:* ]]; do
+    path_dir="${remaining%%:*}"
+    remaining="${remaining#*:}"
+
+    case "$path_dir" in
+      ""|".")
+        continue
+        ;;
+    esac
+    [[ "$path_dir" == /* ]] || continue
+
+    canonical_dir="$(canonical_safe_runtime_path_entry "$path_dir" 2>/dev/null || true)"
+    [[ -n "$canonical_dir" ]] || continue
+
+    if [[ "$seen_after" -eq 0 ]]; then
+      if [[ "$canonical_dir" == "$after_dir" ]]; then
+        seen_after=1
+      fi
+      continue
+    fi
+
+    candidate="${canonical_dir}/${binary_name}"
+    [[ -x "$candidate" && ! -d "$candidate" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  return 1
+}
+
+path_contains_runtime_executable() {
+  local binary_name="${1:-}"
+  local path_value="${2:-$PATH}"
+  local remaining="${path_value}:"
+  local path_dir=""
+
+  while [[ "$remaining" == *:* ]]; do
+    path_dir="${remaining%%:*}"
+    remaining="${remaining#*:}"
+    [[ -n "$path_dir" && "$path_dir" == /* ]] || continue
+    [[ -x "${path_dir%/}/${binary_name}" && ! -d "${path_dir%/}/${binary_name}" ]] || continue
+    return 0
+  done
+
+  return 1
+}
+
+resolve_runtime_candidate() {
+  local binary_name="${1:-}"
+  local candidate="${2:-}"
+  local path_value="${3:-$PATH}"
+  local resolved=""
+
+  [[ -n "$candidate" ]] || return 1
+
+  if ! is_likely_runtime_shim "$binary_name" "$candidate"; then
+    is_trusted_runtime_binary "$candidate" >/dev/null || return 1
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  if resolved="$(resolve_mise_binary_from_shim "$candidate" "$binary_name" "$path_value")"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  if [[ "$binary_name" == "cargo" ]] && resolved="$(resolve_rustup_cargo_from_proxy "$candidate" "$path_value")"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_runtime_binary() {
+  local binary_name="${1:-}"
+  local path_value="${2:-$PATH}"
+  local candidate=""
+  candidate="$(first_runtime_candidate "$binary_name" "$path_value")" || return 1
+  resolve_runtime_candidate "$binary_name" "$candidate" "$path_value"
+}
+
+is_skippable_symlinked_node_runtime_candidate() {
+  local candidate="${1:-}"
+  [[ -L "$candidate" ]] || return 1
+  case "$candidate" in
+    /opt/homebrew/bin/node|/usr/local/bin/node)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+
+node_runtime_fallback_candidates() {
+  local home_dir=""
+  local candidate_dir=""
+  local canonical_dir=""
+
+  home_dir="$(trim_trailing_slash "$(trusted_runtime_owner_home)")" || return 1
+  for candidate_dir in \
+    "$home_dir"/.local/share/mise/installs/node/*/bin \
+    "$home_dir"/.mise/installs/node/*/bin; do
+    [[ -x "$candidate_dir/node" && ! -d "$candidate_dir/node" ]] || continue
+    canonical_dir="$(canonical_safe_runtime_path_entry "$candidate_dir" 2>/dev/null || true)"
+    [[ -n "$canonical_dir" ]] || continue
+    printf '%s/node\n' "$canonical_dir"
+  done
+}
+
+node_runtime_candidates() {
+  local path_value="${1:-$PATH}"
+  local candidate=""
+  local after_dir=""
+
+  if candidate="$(first_runtime_candidate node "$path_value")"; then
+    printf '%s\n' "$candidate"
+    after_dir="$(runtime_binary_dir "$candidate")" || after_dir=""
+    while [[ -n "$after_dir" ]] && candidate="$(first_runtime_candidate_after node "$path_value" "$after_dir")"; do
+      printf '%s\n' "$candidate"
+      after_dir="$(runtime_binary_dir "$candidate")" || break
+    done
+  elif path_contains_runtime_executable node "$path_value"; then
+    return 0
+  fi
+  node_runtime_fallback_candidates
+}
+
+resolve_compatible_node_binary() {
+  local path_value="${1:-$PATH}"
+  local repo_root="${2:-}"
+  local candidate=""
+  local resolved=""
+  local last_probe_error=""
+  local saw_candidate=0
+  local seen_candidates=$'\n'
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    saw_candidate=1
+    case "$seen_candidates" in
+      *$'\n'"$candidate"$'\n'*) continue ;;
+    esac
+    seen_candidates+="$candidate"$'\n'
+    if ! resolved="$(resolve_runtime_candidate node "$candidate" "$path_value")"; then
+      last_probe_error="trusted node runtime candidate rejected: $candidate"
+      is_skippable_symlinked_node_runtime_candidate "$candidate" || return 1
+      continue
+    fi
+    # The Node semantic backend was removed (S3-B3); there is no longer a
+    # node_modules tree to probe for runtime compatibility. Any
+    # trusted, resolvable node binary is accepted (the `node` runtime contract
+    # is still exposed for generic tooling via __internal-runtime-env/-run-runtime).
+    printf '%s\n' "$resolved"
+    return 0
+  done < <(node_runtime_candidates "$path_value")
+
+  if [[ -n "$last_probe_error" ]]; then
+    printf '%s\n' "$last_probe_error" >&2
+  elif [[ "$saw_candidate" -eq 0 ]]; then
+    printf '%s\n' "no trusted node runtime candidates found in PATH or mise installs" >&2
+  fi
+  return 1
+}
+
+resolve_node_binary() {
+  resolve_compatible_node_binary "${1:-$PATH}" "${2:-}"
+}
+
+resolve_cargo_binary() {
+  resolve_runtime_binary cargo "${1:-$PATH}"
+}
+
+emit_runtime_env() {
+  local binary_name="${1:-}"
+  local runtime_path="${2:-$PATH}"
+  local repo_root="${3:-}"
+
+  resolve_runtime_env_values "$binary_name" "$runtime_path" "$repo_root"
+  printf 'RUNTIME_BINARY=%q\n' "$RUNTIME_BINARY"
+  printf 'RUNTIME_PATH=%q\n' "$RUNTIME_PATH"
+  printf 'RUNTIME_TOOLCHAIN_BIN=%q\n' "${RUNTIME_TOOLCHAIN_BIN:-}"
+  printf 'RUNTIME_HOME=%q\n' "$RUNTIME_HOME"
+  printf 'RUNTIME_CARGO_HOME=%q\n' "${RUNTIME_CARGO_HOME:-}"
+  printf 'RUNTIME_RUSTUP_HOME=%q\n' "${RUNTIME_RUSTUP_HOME:-}"
+}
+
+emit_runtime_env_json() {
+  local binary_name="${1:-}"
+  local runtime_path="${2:-$PATH}"
+  local repo_root="${3:-}"
+
+  resolve_runtime_env_values "$binary_name" "$runtime_path" "$repo_root"
+  "$RESOLVED_JQ" -n \
+    --arg runtime_binary "$RUNTIME_BINARY" \
+    --arg runtime_path "$RUNTIME_PATH" \
+    --arg runtime_toolchain_bin "${RUNTIME_TOOLCHAIN_BIN:-}" \
+    --arg runtime_home "$RUNTIME_HOME" \
+    --arg runtime_cargo_home "${RUNTIME_CARGO_HOME:-}" \
+    --arg runtime_rustup_home "${RUNTIME_RUSTUP_HOME:-}" \
+    '{
+      runtime_binary: $runtime_binary,
+      runtime_path: $runtime_path,
+      runtime_toolchain_bin: $runtime_toolchain_bin,
+      runtime_home: $runtime_home,
+      runtime_cargo_home: $runtime_cargo_home,
+      runtime_rustup_home: $runtime_rustup_home
+    }'
+}
+
+resolve_runtime_env_values() {
+  local binary_name="${1:-}"
+  local runtime_path="${2:-$PATH}"
+  local repo_root="${3:-}"
+  local raw_runtime_path="$runtime_path"
+  local runtime_binary=""
+  local runtime_home=""
+  local runtime_cargo_home=""
+  local runtime_rustup_home=""
+  local runtime_toolchain_bin=""
+
+  [[ "$binary_name" == "cargo" || "$binary_name" == "node" ]] || die "unsupported runtime binary: $binary_name"
+
+  runtime_path="$(sanitize_runtime_path "$runtime_path")"
+  if [[ "$binary_name" == "cargo" ]]; then
+    runtime_binary="$(resolve_cargo_binary "$raw_runtime_path")" || die "cargo runtime not found"
+    runtime_home="$(resolve_cargo_runtime_home "$runtime_binary")" || die "cargo runtime home not trusted"
+    runtime_cargo_home="${runtime_home}/.cargo"
+    runtime_rustup_home="${runtime_home}/.rustup"
+    runtime_toolchain_bin="$(resolve_rust_toolchain_bin "$runtime_binary" || true)"
+  else
+    runtime_binary="$(resolve_node_binary "$raw_runtime_path" "$repo_root")" || die "node runtime not found"
+    runtime_home="$(resolve_node_runtime_home)" || die "node runtime home not trusted"
+  fi
+
+  RUNTIME_BINARY="$runtime_binary"
+  RUNTIME_PATH="$runtime_path"
+  RUNTIME_TOOLCHAIN_BIN="$runtime_toolchain_bin"
+  RUNTIME_HOME="$runtime_home"
+  RUNTIME_CARGO_HOME="$runtime_cargo_home"
+  RUNTIME_RUSTUP_HOME="$runtime_rustup_home"
+}
+
+load_runtime_env() {
+  local binary_name="${1:-}"
+  local raw_runtime_path="${2:-$PATH}"
+  local repo_root="${3:-}"
+
+  [[ "$binary_name" == "cargo" || "$binary_name" == "node" ]] || die "unsupported runtime binary: $binary_name"
+  resolve_runtime_env_values "$binary_name" "$raw_runtime_path" "$repo_root"
+}
+
+trusted_runtime_exec_path() {
+  local binary_name="${1:-}"
+  local exec_path="${RUNTIME_PATH:-}"
+
+  if [[ "$binary_name" == "cargo" && -n "${RUNTIME_TOOLCHAIN_BIN:-}" ]]; then
+    exec_path="${RUNTIME_TOOLCHAIN_BIN}${exec_path:+:${exec_path}}"
+  fi
+
+  printf '%s\n' "$exec_path"
+}
+
+append_trusted_runtime_passthrough_env() {
+  local env_name="${1:-}"
+  local env_value=""
+
+  [[ -n "$env_name" ]] || die "trusted runtime passthrough env name is required"
+  eval "env_value=\${${env_name}:-}"
+  [[ -n "$env_value" ]] || return 0
+  TRUSTED_RUNTIME_ENV_ASSIGNMENTS+=("${env_name}=${env_value}")
+}
+
+trusted_runtime_override_allowed() {
+  local env_name="${1:-}"
+
+  case "$env_name" in
+    RUSTFLAGS)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_trusted_runtime_override_env() {
+  local assignment="${1:-}"
+  local env_name=""
+
+  [[ "$assignment" == *=* ]] || die "trusted runtime env override must be NAME=VALUE: $assignment"
+  env_name="${assignment%%=*}"
+  [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || die "trusted runtime env override name is invalid: $env_name"
+  trusted_runtime_override_allowed "$env_name" \
+    || die "trusted runtime env override is not allowed: $env_name"
+  TRUSTED_RUNTIME_ENV_ASSIGNMENTS+=("$assignment")
+}
+
+build_trusted_runtime_env_assignments() {
+  local binary_name="${1:-}"
+  shift || true
+  local exec_path=""
+  local passthrough_name=""
+
+  [[ "$binary_name" == "cargo" || "$binary_name" == "node" ]] || die "unsupported runtime binary: $binary_name"
+  [[ -n "${RUNTIME_BINARY:-}" ]] || die "trusted runtime binary is required"
+
+  exec_path="$(trusted_runtime_exec_path "$binary_name")"
+  [[ -n "$exec_path" ]] || die "trusted runtime PATH is required"
+  [[ -n "${RUNTIME_HOME:-}" ]] || die "trusted runtime HOME is required"
+
+  TRUSTED_RUNTIME_ENV_ASSIGNMENTS=(
+    "PATH=$exec_path"
+    "HOME=$RUNTIME_HOME"
+  )
+
+  if [[ "$binary_name" == "cargo" ]]; then
+    [[ -n "${RUNTIME_CARGO_HOME:-}" ]] || die "trusted cargo CARGO_HOME is required"
+    [[ -n "${RUNTIME_RUSTUP_HOME:-}" ]] || die "trusted cargo RUSTUP_HOME is required"
+    TRUSTED_RUNTIME_ENV_ASSIGNMENTS+=(
+      "CARGO_HOME=$RUNTIME_CARGO_HOME"
+      "RUSTUP_HOME=$RUNTIME_RUSTUP_HOME"
+    )
+  fi
+
+  for passthrough_name in "${TRUSTED_RUNTIME_PASSTHROUGH_ENV_NAMES[@]}"; do
+    append_trusted_runtime_passthrough_env "$passthrough_name"
+  done
+
+  while [[ $# -gt 0 ]]; do
+    append_trusted_runtime_override_env "$1"
+    shift
+  done
+}
+
+exec_trusted_runtime() {
+  local binary_name="${1:-}"
+  shift || true
+  local repo_root=""
+  local override_assignments=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo-root)
+        [[ $# -ge 2 ]] || die "trusted runtime --repo-root requires a value"
+        repo_root="$(canonicalize_dir "$2")"
+        shift 2
+        ;;
+      --env)
+        [[ $# -ge 2 ]] || die "trusted runtime --env requires NAME=VALUE"
+        override_assignments+=("$2")
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  [[ $# -gt 0 ]] || die "trusted runtime command arguments are required"
+  load_runtime_env "$binary_name" "$PATH" "$repo_root"
+  if [[ ${#override_assignments[@]} -gt 0 ]]; then
+    build_trusted_runtime_env_assignments "$binary_name" "${override_assignments[@]}"
+  else
+    build_trusted_runtime_env_assignments "$binary_name"
+  fi
+  exec /usr/bin/env -i "${TRUSTED_RUNTIME_ENV_ASSIGNMENTS[@]}" "$RUNTIME_BINARY" "$@"
+}
+
+rust_workspace_candidate_roots() {
+  local root="${1:-}"
+  [[ -n "$root" ]] || die "repo root is required"
+  printf '%s\n' "$root/harness-rust"
+}
+
+reset_rust_workspace_resolution() {
+  RUST_WORKSPACE_RESOLUTION_STATE=""
+  RUST_WORKSPACE_RESOLUTION_ROOT=""
+  RUST_WORKSPACE_RESOLUTION_ERROR=""
+}
+
+append_rust_workspace_resolution_error() {
+  local message="${1:-}"
+  [[ -n "$message" ]] || return 0
+  if [[ -n "$RUST_WORKSPACE_RESOLUTION_ERROR" ]]; then
+    RUST_WORKSPACE_RESOLUTION_ERROR="${RUST_WORKSPACE_RESOLUTION_ERROR}; ${message}"
+  else
+    RUST_WORKSPACE_RESOLUTION_ERROR="$message"
+  fi
+}
+
+probe_rust_workspace_root() {
+  local root="${1:-}"
+  [[ -n "$root" ]] || die "repo root is required"
+
+  reset_rust_workspace_resolution
+
+  local normalized_root=""
+  local candidate=""
+  local resolved_candidate=""
+  local manifest_path=""
+  local resolved_manifest_parent=""
+  local valid_count=0
+  local -a valid_candidates=()
+
+  normalized_root="$(canonicalize_dir "$root")" || die "repo root must exist: $root"
+
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    if [[ ! -e "$candidate" ]]; then
+      continue
+    fi
+    if [[ -L "$candidate" ]]; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace candidate must not be a symlink: $candidate"
+      continue
+    fi
+    if ! (assert_no_symlink_components "$normalized_root" "$candidate") >/dev/null 2>&1; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace candidate contains a symlink component: $candidate"
+      continue
+    fi
+    if [[ ! -d "$candidate" ]]; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace candidate is not a directory: $candidate"
+      continue
+    fi
+
+    resolved_candidate="$(
+      cd "$candidate" && pwd -P
+    )" || {
+      append_rust_workspace_resolution_error \
+        "Rust workspace candidate could not be canonicalized: $candidate"
+      continue
+    }
+    if ! path_within_root "$resolved_candidate" "$normalized_root"; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace candidate resolves outside repo root: $candidate -> $resolved_candidate"
+      continue
+    fi
+
+    manifest_path="${candidate}/Cargo.toml"
+    if [[ -L "$manifest_path" ]]; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace manifest must not be a symlink: $manifest_path"
+      continue
+    fi
+    if [[ ! -f "$manifest_path" ]]; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace candidate is missing Cargo.toml: $candidate"
+      continue
+    fi
+    if ! (assert_no_symlink_components "$normalized_root" "$manifest_path") >/dev/null 2>&1; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace manifest contains a symlink component: $manifest_path"
+      continue
+    fi
+    resolved_manifest_parent="$(
+      cd "${manifest_path%/*}" && pwd -P
+    )" || {
+      append_rust_workspace_resolution_error \
+        "Rust workspace manifest parent could not be canonicalized: $manifest_path"
+      continue
+    }
+    if ! path_within_root "$resolved_manifest_parent/${manifest_path##*/}" "$normalized_root"; then
+      append_rust_workspace_resolution_error \
+        "Rust workspace manifest resolves outside repo root: $manifest_path"
+      continue
+    fi
+
+    valid_candidates+=("$candidate")
+    valid_count=$((valid_count + 1))
+  done < <(rust_workspace_candidate_roots "$normalized_root")
+
+  if [[ -n "$RUST_WORKSPACE_RESOLUTION_ERROR" ]]; then
+    RUST_WORKSPACE_RESOLUTION_STATE="invalid"
+    return 1
+  fi
+  if [[ "$valid_count" -eq 0 ]]; then
+    RUST_WORKSPACE_RESOLUTION_STATE="absent"
+    return 3
+  fi
+  if [[ "$valid_count" -gt 1 ]]; then
+    RUST_WORKSPACE_RESOLUTION_STATE="ambiguous"
+    RUST_WORKSPACE_RESOLUTION_ERROR="multiple valid Rust workspace roots detected: ${valid_candidates[*]}"
+    return 4
+  fi
+
+  RUST_WORKSPACE_RESOLUTION_STATE="valid"
+  RUST_WORKSPACE_RESOLUTION_ROOT="${valid_candidates[0]}"
+}
+
+resolved_rust_workspace_root() {
+  local root="${1:-}"
+  probe_rust_workspace_root "$root" || true
+  case "$RUST_WORKSPACE_RESOLUTION_STATE" in
+    valid)
+      printf '%s\n' "$RUST_WORKSPACE_RESOLUTION_ROOT"
+      ;;
+    absent)
+      die "Rust workspace root not found; checked harness-rust"
+      ;;
+    ambiguous|invalid)
+      die "$RUST_WORKSPACE_RESOLUTION_ERROR"
+      ;;
+    *)
+      die "invalid Rust workspace resolver state"
+      ;;
+  esac
+}
+
+# NOTE: This harness has no semantic review-queue backend
+# (`resolve_rust_semantic_backend`, `run_cli`, or the per-op `semantic_*`
+# handlers) and no semantic-mcp crate/queue. The Rust workspace probe below is
+# retained
+# only because `__internal-rust-workspace-root` is still consumed by
+# scripts/project-id.sh and the native reviewer surface smoke; it no longer
+# resolves any queue backend.
+
+internal_rust_workspace_root_main() {
+  local repo_root=""
+  local allow_absent=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo-root)
+        [[ $# -ge 2 ]] || die "__internal-rust-workspace-root requires --repo-root value"
+        repo_root="$(canonicalize_dir "$2")"
+        shift 2
+        ;;
+      --allow-absent)
+        allow_absent=1
+        shift
+        ;;
+      *)
+        die "unknown argument for __internal-rust-workspace-root: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "$repo_root" ]]; then
+    repo_root="$(canonicalize_dir "$(script_dir)/..")"
+  fi
+
+  probe_rust_workspace_root "$repo_root" || true
+  case "$RUST_WORKSPACE_RESOLUTION_STATE" in
+    valid)
+      printf '%s\n' "$RUST_WORKSPACE_RESOLUTION_ROOT"
+      ;;
+    absent)
+      if [[ "$allow_absent" -eq 1 ]]; then
+        return 3
+      fi
+      die "Rust workspace root not found; checked harness-rust"
+      ;;
+    ambiguous|invalid)
+      die "$RUST_WORKSPACE_RESOLUTION_ERROR"
+      ;;
+    *)
+      die "invalid Rust workspace resolver state"
+      ;;
+  esac
+}
+
+flag_allowed_for_command() {
+  local command="$1"
+  local flag="$2"
+
+  case "$command" in
+    enqueue)
+      case "$flag" in
+        --repo-root|--file-path|--source|--export-json)
+          return 0
+          ;;
+      esac
+      ;;
+    lease|drain)
+      case "$flag" in
+        --repo-root|--lease-run-id|--lease-seconds)
+          return 0
+          ;;
+      esac
+      ;;
+    complete)
+      case "$flag" in
+        --repo-root|--lease-owner|--expected-file|--lease-run-id|--project-id)
+          return 0
+          ;;
+      esac
+      ;;
+    requeue)
+      case "$flag" in
+        --repo-root|--lease-owner|--expected-file|--lease-run-id|--project-id|--error)
+          return 0
+          ;;
+      esac
+      ;;
+    export-json)
+      case "$flag" in
+        --repo-root|--project-id|--output)
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+
+  return 1
+}
+
+validate_command_flags() {
+  local command="$1"
+  shift
+  local seen_flags=("$@")
+  local validated_flags=()
+  local flag=""
+  local validated_flag=""
+
+  for flag in "${seen_flags[@]}"; do
+    if ! flag_allowed_for_command "$command" "$flag"; then
+      die "$command does not allow $flag"
+    fi
+
+    case "$command:$flag" in
+      complete:--expected-file|requeue:--expected-file)
+        validated_flags+=("$flag")
+        continue
+        ;;
+    esac
+
+    if [[ "${#validated_flags[@]}" -gt 0 ]]; then
+      for validated_flag in "${validated_flags[@]}"; do
+        [[ "$validated_flag" == "$flag" ]] || continue
+        die "duplicate flag: $flag"
+      done
+    fi
+
+    validated_flags+=("$flag")
+  done
+}
+
+resolve_project_id() {
+  local repo_root="$1"
+  local resolver=""
+  # S6 removed the semantic resolver wrapper (resolve-semantic-project-id.sh);
+  # delegate directly to the kept non-semantic core resolver. The core `read`
+  # subcommand resolves and prints the canonical .shared/project_id and fails
+  # closed (die) when the artifact is missing.
+  resolver="$(script_dir)/project-id.sh"
+  [[ -x "$resolver" ]] || die "project_id resolver not found or not executable: $resolver"
+  PROJECT_ID_REPO_ROOT="$repo_root" /bin/bash "$resolver" read
+}
+
+internal_runtime_env_main() {
+  local binary_name=""
+  local repo_root=""
+  local output_format="shell"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --binary)
+        [[ $# -ge 2 ]] || die "__internal-runtime-env requires --binary value"
+        binary_name="$2"
+        shift 2
+        ;;
+      --repo-root)
+        [[ $# -ge 2 ]] || die "__internal-runtime-env requires --repo-root value"
+        repo_root="$(canonicalize_dir "$2")"
+        shift 2
+        ;;
+      --json)
+        output_format="json"
+        shift
+        ;;
+      *)
+        die "unknown argument for __internal-runtime-env: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$binary_name" ]] || die "__internal-runtime-env requires --binary"
+  case "$output_format" in
+    shell) emit_runtime_env "$binary_name" "$PATH" "$repo_root" ;;
+    json) emit_runtime_env_json "$binary_name" "$PATH" "$repo_root" ;;
+    *) die "unsupported __internal-runtime-env output format: $output_format" ;;
+  esac
+}
+
+internal_run_runtime_main() {
+  local binary_name=""
+  local repo_root=""
+  local override_assignments=()
+  local runtime_args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --binary)
+        [[ $# -ge 2 ]] || die "__internal-run-runtime requires --binary value"
+        binary_name="$2"
+        shift 2
+        ;;
+      --repo-root)
+        [[ $# -ge 2 ]] || die "__internal-run-runtime requires --repo-root value"
+        repo_root="$(canonicalize_dir "$2")"
+        shift 2
+        ;;
+      --env)
+        [[ $# -ge 2 ]] || die "__internal-run-runtime requires NAME=VALUE after --env"
+        override_assignments+=("$2")
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        die "unknown argument for __internal-run-runtime: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$binary_name" ]] || die "__internal-run-runtime requires --binary"
+  [[ $# -gt 0 ]] || die "__internal-run-runtime requires a command"
+  if [[ -n "$repo_root" ]]; then
+    runtime_args+=(--repo-root "$repo_root")
+  fi
+  while [[ "${#override_assignments[@]}" -gt 0 ]]; do
+    runtime_args+=(--env "${override_assignments[0]}")
+    override_assignments=("${override_assignments[@]:1}")
+  done
+  runtime_args+=(-- "$@")
+  exec_trusted_runtime "$binary_name" "${runtime_args[@]}"
+}
+
+validate_project_id() {
+  local project_id="${1:-}"
+
+  [[ -n "$project_id" ]] || die "project_id must not be empty"
+  [[ ${#project_id} -le 64 ]] || die "project_id must be <= 64 characters"
+  [[ ! "$project_id" =~ [[:cntrl:]] ]] || die "project_id must not contain control bytes"
+  [[ "$project_id" =~ ^[A-Za-z0-9_-]+$ ]] || die "project_id must contain only letters, numbers, '_' or '-'"
+  [[ "$project_id" != "agent_base" ]] || die "legacy project_id 'agent_base' is not allowed on DB-authoritative paths"
+}
+
+validate_queue_source() {
+  local source="${1:-}"
+  local normalized=""
+
+  normalized="$(trim_ascii_whitespace "$source")"
+  [[ -n "$normalized" ]] || die "source must contain only letters, numbers, '_' or '-' and be <= 32 characters"
+  [[ ${#normalized} -le 32 ]] || die "source must contain only letters, numbers, '_' or '-' and be <= 32 characters"
+  [[ "$normalized" =~ ^[A-Za-z0-9_-]+$ ]] || die "source must contain only letters, numbers, '_' or '-' and be <= 32 characters"
+  printf '%s\n' "$normalized"
+}
+
+validate_queue_lease_owner() {
+  local lease_owner="${1:-}"
+  local normalized=""
+
+  normalized="$(trim_ascii_whitespace "$lease_owner")"
+  [[ -n "$normalized" ]] || die "lease_owner must contain only letters, numbers, or '-'"
+  [[ ${#normalized} -le 128 ]] || die "lease_owner must contain only letters, numbers, or '-'"
+  [[ "$normalized" =~ ^[A-Za-z0-9-]+$ ]] || die "lease_owner must contain only letters, numbers, or '-'"
+  printf '%s\n' "$normalized"
+}
+
+validate_optional_queue_lease_run_id() {
+  local lease_run_id="${1:-}"
+  local normalized=""
+
+  [[ -n "$lease_run_id" ]] || {
+    printf '\n'
+    return 0
+  }
+  normalized="$(trim_ascii_whitespace "$lease_run_id")"
+  [[ -n "$normalized" ]] || die "lease_run_id must contain only letters, numbers, '.', '_', ':' or '-' and be <= 128 characters"
+  [[ ${#normalized} -le 128 ]] || die "lease_run_id must contain only letters, numbers, '.', '_', ':' or '-' and be <= 128 characters"
+  [[ "$normalized" =~ ^[A-Za-z0-9._:-]+$ ]] || die "lease_run_id must contain only letters, numbers, '.', '_', ':' or '-' and be <= 128 characters"
+  printf '%s\n' "$normalized"
+}
+
+resolve_effective_project_id() {
+  local repo_root="$1"
+  local requested_project_id="${2:-}"
+  local resolved_project_id=""
+
+  resolved_project_id="$(resolve_project_id "$repo_root")" \
+    || die "failed to resolve project_id for repo: $repo_root"
+  if [[ -n "$requested_project_id" ]]; then
+    validate_project_id "$requested_project_id"
+    [[ "$requested_project_id" == "$resolved_project_id" ]] \
+      || die "project_id mismatch: requested=${requested_project_id} resolved=${resolved_project_id}"
+  fi
+
+  printf '%s\n' "$resolved_project_id"
+}
+
+json_array_from_args() {
+  "$RESOLVED_JQ" -n '$ARGS.positional' --args "$@"
+}
+
+core_queue_public_snapshot_json() {
+  "$RESOLVED_JQ" '.items |= map(del(.lease_run_id))'
+}
+
+utc_now() {
+  /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+new_queue_id() {
+  local prefix="${1:-id}"
+  local now=""
+  now="$(/bin/date -u '+%Y%m%dT%H%M%SZ')"
+  printf '%s-%s-%s-%s\n' "$prefix" "$now" "$$" "$RANDOM"
+}
+
+review_queue_backend() {
+  local backend="${REVHARNESS_REVIEW_QUEUE_BACKEND:-core}"
+  case "$backend" in
+    core)
+      printf '%s\n' "$backend"
+      ;;
+    *)
+      # There is no `semantic` backend in this harness; any non-core
+      # value (including `semantic`) is treated as unknown and fails closed.
+      printf 'unknown\n'
+      ;;
+  esac
+}
+
+review_queue_unknown_backend_token() {
+  local raw_value="${REVHARNESS_REVIEW_QUEUE_BACKEND:-}"
+  local token=""
+
+  token="$(printf '%s' "$raw_value" | LC_ALL=C tr -cd 'A-Za-z0-9._-' | cut -c 1-32)"
+  [[ -n "$token" ]] || token="invalid"
+  printf '%s\n' "$token"
+}
+
+review_queue_state_dir() {
+  local repo_root="$1"
+  if [[ -n "${REVHARNESS_REVIEW_QUEUE_STATE_DIR:-}" ]]; then
+    printf '%s\n' "$REVHARNESS_REVIEW_QUEUE_STATE_DIR"
+    return 0
+  fi
+  printf '%s/.agent/state/review_queue\n' "$repo_root"
+}
+
+review_queue_metrics_path() {
+  local repo_root="$1"
+  if [[ -n "${REVHARNESS_REVIEW_QUEUE_METRICS:-}" ]]; then
+    printf '%s\n' "$REVHARNESS_REVIEW_QUEUE_METRICS"
+    return 0
+  fi
+  printf '%s/.agent/metrics/review_queue_events.jsonl\n' "$repo_root"
+}
+
+repo_relative_or_empty() {
+  local repo_root="$1"
+  local value="${2:-}"
+  [[ -n "$value" ]] || {
+    printf '\n'
+    return 0
+  }
+  case "$value" in
+    "$repo_root"/*)
+      printf '%s\n' "${value#"$repo_root"/}"
+      ;;
+    /*)
+      printf '<external>\n'
+      ;;
+    *)
+      printf '%s\n' "$value"
+      ;;
+  esac
+}
+
+emit_review_queue_metric() {
+  local repo_root="$1"
+  local event="$2"
+  local backend="$3"
+  local project_id="${4:-}"
+  local file_path="${5:-}"
+  local source="${6:-}"
+  local reason="${7:-}"
+  local metrics_path=""
+  local metrics_dir=""
+  local ts=""
+  local rel_file=""
+  local payload=""
+
+  metrics_path="$(review_queue_metrics_path "$repo_root")"
+  metrics_dir="$(path_parent_dir "$metrics_path")"
+  mkdir -p "$metrics_dir" 2>/dev/null || return 0
+  ts="$(utc_now)"
+  rel_file="$(repo_relative_or_empty "$repo_root" "$file_path")"
+  payload="$(
+    "$RESOLVED_JQ" -nc \
+      --arg ts "$ts" \
+      --arg event "$event" \
+      --arg backend "$backend" \
+      --arg project_id "$project_id" \
+      --arg file_path "$rel_file" \
+      --arg source "$source" \
+      --arg reason "$reason" \
+      '{
+        schema_version: 1,
+        ts: $ts,
+        event: $event,
+        backend: $backend,
+        project_id: $project_id,
+        file_path: $file_path,
+        source: $source,
+        reason: $reason,
+        fail_behavior: (if $event == "backend-unavailable" then "fail-closed" else "" end)
+      }'
+  )" || return 0
+  printf '%s\n' "$payload" >> "$metrics_path" 2>/dev/null || true
+}
+
+CORE_QUEUE_LOCK_DIR=""
+CORE_QUEUE_LOCK_RECLAIM_REASON=""
+
+core_queue_lock_ttl_seconds() {
+  local ttl="${REVHARNESS_REVIEW_QUEUE_LOCK_TTL_SECONDS:-30}"
+  [[ "$ttl" =~ ^[1-9][0-9]*$ ]] || ttl="30"
+  printf '%s\n' "$ttl"
+}
+
+path_mtime_epoch() {
+  local path_value="${1:-}"
+  local mtime=""
+
+  mtime="$(stat -f %m "$path_value" 2>/dev/null || stat -c %Y "$path_value" 2>/dev/null || true)"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$mtime"
+}
+
+pid_is_live() {
+  local pid="${1:-}"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+core_queue_maybe_reclaim_stale_lock() {
+  local lock_dir="$1"
+  local ttl=""
+  local now=""
+  local mtime=""
+  local pid=""
+
+  [[ -d "$lock_dir" && ! -L "$lock_dir" ]] || return 1
+  ttl="$(core_queue_lock_ttl_seconds)"
+  now="$(/bin/date +%s)"
+  mtime="$(path_mtime_epoch "$lock_dir")" || return 1
+  (( now - mtime >= ttl )) || return 1
+
+  if [[ -f "$lock_dir/pid" && ! -L "$lock_dir/pid" ]]; then
+    pid="$(head -n 1 "$lock_dir/pid" 2>/dev/null | tr -cd '0-9')"
+    if [[ -n "$pid" ]] && pid_is_live "$pid"; then
+      return 1
+    fi
+  fi
+
+  /bin/rm -rf "$lock_dir" 2>/dev/null || return 1
+  CORE_QUEUE_LOCK_RECLAIM_REASON="stale-lock-reclaimed"
+  return 0
+}
+
+core_queue_prepare() {
+  local repo_root="$1"
+  local state_dir=""
+  local events_file=""
+
+  state_dir="$(review_queue_state_dir "$repo_root")"
+  events_file="$state_dir/events.jsonl"
+
+  mkdir -p "$state_dir" || {
+    CORE_QUEUE_ERROR="failed to create core review queue state dir"
+    return 1
+  }
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] || {
+    CORE_QUEUE_ERROR="core review queue state path is not a trusted directory"
+    return 1
+  }
+  : >> "$events_file" || {
+    CORE_QUEUE_ERROR="failed to write core review queue events file"
+    return 1
+  }
+  [[ -f "$events_file" && ! -L "$events_file" ]] || {
+    CORE_QUEUE_ERROR="core review queue events path is not a trusted file"
+    return 1
+  }
+}
+
+core_queue_events_file() {
+  local repo_root="$1"
+  printf '%s/events.jsonl\n' "$(review_queue_state_dir "$repo_root")"
+}
+
+core_queue_acquire_lock() {
+  local repo_root="$1"
+  local project_id="${2:-}"
+  local file_path="${3:-}"
+  local source="${4:-}"
+  local state_dir=""
+  local lock_dir=""
+  local start=""
+  local now=""
+
+  state_dir="$(review_queue_state_dir "$repo_root")"
+  lock_dir="$state_dir/queue.lock.d"
+  CORE_QUEUE_LOCK_RECLAIM_REASON=""
+  start="$(/bin/date +%s)"
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if core_queue_maybe_reclaim_stale_lock "$lock_dir"; then
+      emit_review_queue_metric "$repo_root" "lock-reclaimed" "core" "$project_id" "$file_path" "$source" "$CORE_QUEUE_LOCK_RECLAIM_REASON"
+      continue
+    fi
+    now="$(/bin/date +%s)"
+    if (( now - start >= 10 )); then
+      CORE_QUEUE_ERROR="timed out acquiring core review queue lock"
+      return 1
+    fi
+    sleep 0.1
+  done
+  {
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    printf '%s\n' "$(utc_now)" > "$lock_dir/acquired_at"
+  } 2>/dev/null || {
+    /bin/rm -f "$lock_dir/pid" "$lock_dir/acquired_at" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+    CORE_QUEUE_ERROR="failed to write core review queue lock metadata"
+    return 1
+  }
+  CORE_QUEUE_LOCK_DIR="$lock_dir"
+}
+
+core_queue_release_lock() {
+  if [[ -n "${CORE_QUEUE_LOCK_DIR:-}" ]]; then
+    /bin/rm -f "$CORE_QUEUE_LOCK_DIR/pid" "$CORE_QUEUE_LOCK_DIR/acquired_at" 2>/dev/null || true
+    rmdir "$CORE_QUEUE_LOCK_DIR" 2>/dev/null || true
+    CORE_QUEUE_LOCK_DIR=""
+  fi
+}
+
+trap 'core_queue_release_lock' EXIT
+
+core_queue_enter_or_die() {
+  local repo_root="$1"
+  local project_id="$2"
+  local file_path="${3:-}"
+  local source="${4:-}"
+
+  CORE_QUEUE_ERROR=""
+  if ! core_queue_prepare "$repo_root"; then
+    emit_review_queue_metric "$repo_root" "backend-unavailable" "core" "$project_id" "$file_path" "$source" "$CORE_QUEUE_ERROR"
+    die "core review queue backend unavailable: $CORE_QUEUE_ERROR"
+  fi
+  if ! core_queue_acquire_lock "$repo_root" "$project_id" "$file_path" "$source"; then
+    emit_review_queue_metric "$repo_root" "backend-unavailable" "core" "$project_id" "$file_path" "$source" "$CORE_QUEUE_ERROR"
+    die "core review queue backend unavailable: $CORE_QUEUE_ERROR"
+  fi
+}
+
+core_queue_snapshot_json() {
+  local repo_root="$1"
+  local project_id="$2"
+  local now="$3"
+  local events_file=""
+
+  events_file="$(core_queue_events_file "$repo_root")"
+  "$RESOLVED_JQ" -s --arg project_id "$project_id" --arg exported_at "$now" '
+    def empty_item:
+      {
+        event_id: null,
+        dedupe_key: "",
+        file_path: "",
+        source: "",
+        queue_state: "",
+        first_enqueued_at: "",
+        last_enqueued_at: "",
+        lease_owner: null,
+        lease_run_id: null,
+        leased_at: null,
+        lease_expires_at: null,
+        acknowledged_at: null,
+        retry_count: 0,
+        last_error: null
+      };
+    def state_map:
+      reduce .[] as $e ({};
+        if $e.project_id != $project_id then
+          .
+        elif $e.op == "enqueue" then
+          .[$e.file_path] as $old
+          | if (($old.queue_state // "") == "pending") then
+              .
+            elif (($old.queue_state // "") == "leased") then
+              .[$e.file_path] = ($old + {
+                event_id: $e.event_id,
+                dedupe_key: $e.file_path,
+                file_path: $e.file_path,
+                source: $e.source,
+                queue_state: "leased",
+                first_enqueued_at: ($old.first_enqueued_at // $e.at),
+                last_enqueued_at: $e.at,
+                acknowledged_at: null,
+                last_error: null
+              })
+            else
+              .[$e.file_path] = (empty_item + {
+                event_id: $e.event_id,
+                dedupe_key: $e.file_path,
+                file_path: $e.file_path,
+                source: $e.source,
+                queue_state: "pending",
+                first_enqueued_at: (if (($old.queue_state // "") == "done") or ($old == null) then $e.at else ($old.first_enqueued_at // $e.at) end),
+                last_enqueued_at: $e.at,
+                retry_count: (if (($old.queue_state // "") == "done") or ($old == null) then 0 else ($old.retry_count // 0) end)
+              })
+            end
+        elif $e.op == "lease" then
+          reduce (($e.items // [])[]) as $file (.;
+            if .[$file] then
+              .[$file].queue_state = "leased"
+              | .[$file].lease_owner = $e.lease_owner
+              | .[$file].lease_run_id = $e.lease_run_id
+              | .[$file].leased_at = $e.leased_at
+              | .[$file].lease_expires_at = $e.lease_expires_at
+              | .[$file].acknowledged_at = null
+              | .[$file].last_error = null
+            else
+              .
+            end)
+        elif $e.op == "complete" then
+          reduce (($e.items // [])[]) as $file (.;
+            if .[$file] then
+              .[$file].queue_state = "done"
+              | .[$file].lease_owner = $e.lease_owner
+              | .[$file].lease_run_id = null
+              | .[$file].lease_expires_at = null
+              | .[$file].acknowledged_at = $e.completed_at
+              | .[$file].last_error = null
+            else
+              .
+            end)
+        elif $e.op == "requeue" then
+          reduce (($e.items // [])[]) as $file (.;
+            if .[$file] then
+              .[$file].queue_state = "pending"
+              | .[$file].lease_owner = null
+              | .[$file].lease_run_id = null
+              | .[$file].leased_at = null
+              | .[$file].lease_expires_at = null
+              | .[$file].acknowledged_at = null
+              | .[$file].retry_count = ((.[$file].retry_count // 0) + 1)
+              | .[$file].last_error = ($e.error // null)
+            else
+              .
+            end)
+        else
+          .
+        end);
+    (state_map
+      | to_entries
+      | map(.value)
+      | map(select(.queue_state == "pending" or .queue_state == "leased"))
+      | sort_by(.first_enqueued_at, .file_path)) as $items
+    | {
+        project_id: $project_id,
+        exported_at: $exported_at,
+        pending_count: ($items | map(select(.queue_state == "pending")) | length),
+        leased_count: ($items | map(select(.queue_state == "leased")) | length),
+        pending_review: (($items | length) > 0),
+        changed_files: ($items | map(.file_path)),
+        last_change: (($items | map(if ((.leased_at // "") > .last_enqueued_at) then (.leased_at // "") else .last_enqueued_at end) | max) // ""),
+        items: $items
+      }
+  ' "$events_file"
+}
+
+core_queue_write_export() {
+  local repo_root="$1"
+  local project_id="$2"
+  local output_path="$3"
+  local snapshot=""
+  local output_dir=""
+
+  [[ -n "$output_path" ]] || return 0
+  snapshot="$(core_queue_snapshot_json "$repo_root" "$project_id" "$(utc_now)")"
+  output_dir="$(path_parent_dir "$output_path")"
+  mkdir -p "$output_dir" || die "failed to create queue export directory: $output_dir"
+  core_queue_public_snapshot_json <<< "$snapshot" > "$output_path" || die "failed to write queue export: $output_path"
+}
+
+core_queue_append_event() {
+  local repo_root="$1"
+  local event_json="$2"
+  local events_file=""
+
+  events_file="$(core_queue_events_file "$repo_root")"
+  printf '%s\n' "$event_json" >> "$events_file" || die "failed to append core review queue event"
+}
+
+core_enqueue_file() {
+  local repo_root="$1"
+  local file_path="$2"
+  local source="$3"
+  local export_json_path="$4"
+  local canonical_file_path=""
+  local project_id=""
+  local snapshot=""
+  local existing_item=""
+  local existing_state=""
+  local event_json=""
+  local item_json=""
+  local output_json=""
+  local now=""
+
+  [[ -n "$file_path" ]] || die "enqueue requires --file-path"
+  [[ -n "$source" ]] || die "enqueue requires --source"
+  source="$(validate_queue_source "$source")"
+  canonical_file_path="$(canonicalize_queue_enqueue_file_path "$repo_root" "$file_path")"
+
+  project_id="$(resolve_project_id "$repo_root")" \
+    || die "failed to resolve project_id for repo: $repo_root"
+
+  core_queue_enter_or_die "$repo_root" "$project_id" "$canonical_file_path" "$source"
+  now="$(utc_now)"
+  snapshot="$(core_queue_snapshot_json "$repo_root" "$project_id" "$now")"
+  existing_item="$("$RESOLVED_JQ" -c --arg file_path "$canonical_file_path" '.items[]? | select(.file_path == $file_path)' <<< "$snapshot")"
+  existing_state="$("$RESOLVED_JQ" -r 'select(. != null) | .queue_state // empty' <<< "${existing_item:-null}")"
+  if [[ "$existing_state" == "pending" ]]; then
+    output_json="$("$RESOLVED_JQ" -nc --argjson item "$existing_item" '{queued:false, duplicate:true, item:($item|del(.lease_run_id))}')"
+    core_queue_write_export "$repo_root" "$project_id" "$export_json_path"
+    core_queue_release_lock
+    emit_review_queue_metric "$repo_root" "enqueue-skipped" "core" "$project_id" "$canonical_file_path" "$source" "duplicate-pending"
+    printf '%s\n' "$output_json"
+    return 0
+  fi
+
+  event_json="$(
+    "$RESOLVED_JQ" -nc \
+      --arg op "enqueue" \
+      --arg project_id "$project_id" \
+      --arg event_id "$(new_queue_id evt)" \
+      --arg file_path "$canonical_file_path" \
+      --arg source "$source" \
+      --arg at "$now" \
+      '{schema_version:1, op:$op, project_id:$project_id, event_id:$event_id, file_path:$file_path, source:$source, at:$at}'
+  )"
+  core_queue_append_event "$repo_root" "$event_json"
+  snapshot="$(core_queue_snapshot_json "$repo_root" "$project_id" "$now")"
+  item_json="$("$RESOLVED_JQ" -c --arg file_path "$canonical_file_path" '.items[] | select(.file_path == $file_path)' <<< "$snapshot")"
+  output_json="$("$RESOLVED_JQ" -nc --argjson item "$item_json" '{queued:true, duplicate:false, item:($item|del(.lease_run_id))}')"
+  core_queue_write_export "$repo_root" "$project_id" "$export_json_path"
+  core_queue_release_lock
+  emit_review_queue_metric "$repo_root" "enqueue-ok" "core" "$project_id" "$canonical_file_path" "$source" ""
+  printf '%s\n' "$output_json"
+}
+
+enqueue_file() {
+  local repo_root="$1"
+  local file_path="$2"
+  local source="$3"
+  local export_json_path="$4"
+  local backend=""
+
+  backend="$(review_queue_backend)"
+  case "$backend" in
+    core)
+      core_enqueue_file "$repo_root" "$file_path" "$source" "$export_json_path"
+      ;;
+    *)
+      emit_review_queue_metric "$repo_root" "backend-unavailable" "unknown" "" "$file_path" "$source" "unknown-backend:$(review_queue_unknown_backend_token)"
+      die "unknown REVHARNESS_REVIEW_QUEUE_BACKEND: $(review_queue_unknown_backend_token)"
+      ;;
+  esac
+}
+
+core_lease_work() {
+  local repo_root="$1"
+  local lease_run_id="$2"
+  local lease_seconds="$3"
+  local project_id=""
+  local now=""
+  local expires=""
+  local snapshot=""
+  local lease_owner=""
+  local items_json=""
+  local files_json=""
+  local event_json=""
+  local output_json=""
+
+  [[ -n "$lease_run_id" ]] || die "lease requires --lease-run-id"
+  [[ -n "$lease_seconds" ]] || die "lease requires --lease-seconds"
+  [[ "$lease_seconds" =~ ^[1-9][0-9]*$ ]] || die "--lease-seconds must be a positive integer"
+  lease_run_id="$(validate_optional_queue_lease_run_id "$lease_run_id")"
+
+  project_id="$(resolve_project_id "$repo_root")" \
+    || die "failed to resolve project_id for repo: $repo_root"
+  core_queue_enter_or_die "$repo_root" "$project_id" "" "lease"
+  now="$(utc_now)"
+  expires="$(/bin/date -u -v+"${lease_seconds}"S '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || /bin/date -u -d "+${lease_seconds} seconds" '+%Y-%m-%dT%H:%M:%SZ')"
+  snapshot="$(core_queue_snapshot_json "$repo_root" "$project_id" "$now")"
+  items_json="$("$RESOLVED_JQ" -c --arg now "$now" '[.items[] | select(.queue_state == "pending" or (.queue_state == "leased" and (.lease_expires_at // "") <= $now))]' <<< "$snapshot")"
+  files_json="$("$RESOLVED_JQ" -c '[.[].file_path]' <<< "$items_json")"
+
+  if [[ "$("$RESOLVED_JQ" -r 'length' <<< "$items_json")" == "0" ]]; then
+    core_queue_release_lock
+    "$RESOLVED_JQ" -nc --arg project_id "$project_id" --arg leased_at "$now" --arg lease_run_id "$lease_run_id" --argjson items "$items_json" --argjson expected "$files_json" \
+      '{project_id:$project_id, lease_owner:null, leased_at:$leased_at, lease_expires_at:null, leased_count:0, items:($items|map(del(.lease_run_id))), lease_run_id:$lease_run_id, expected_files:$expected}'
+    return 0
+  fi
+
+  lease_owner="$(new_queue_id lease)"
+  event_json="$(
+    "$RESOLVED_JQ" -nc \
+      --arg project_id "$project_id" \
+      --arg lease_owner "$lease_owner" \
+      --arg lease_run_id "$lease_run_id" \
+      --arg leased_at "$now" \
+      --arg lease_expires_at "$expires" \
+      --argjson items "$files_json" \
+      '{schema_version:1, op:"lease", project_id:$project_id, lease_owner:$lease_owner, lease_run_id:$lease_run_id, leased_at:$leased_at, lease_expires_at:$lease_expires_at, items:$items}'
+  )"
+  core_queue_append_event "$repo_root" "$event_json"
+  output_json="$(
+    "$RESOLVED_JQ" -nc \
+      --arg project_id "$project_id" \
+      --arg lease_owner "$lease_owner" \
+      --arg lease_run_id "$lease_run_id" \
+      --arg leased_at "$now" \
+      --arg lease_expires_at "$expires" \
+      --argjson items "$items_json" \
+      --argjson expected "$files_json" \
+      '{project_id:$project_id, lease_owner:$lease_owner, leased_at:$leased_at, lease_expires_at:$lease_expires_at, leased_count:($items|length), items:($items|map(.queue_state="leased"|.lease_owner=$lease_owner|.lease_run_id=$lease_run_id|.leased_at=$leased_at|.lease_expires_at=$lease_expires_at|del(.lease_run_id))), lease_run_id:$lease_run_id, expected_files:$expected}'
+  )"
+  core_queue_release_lock
+  printf '%s\n' "$output_json"
+}
+
+lease_work() {
+  local repo_root="$1"
+  local lease_run_id="$2"
+  local lease_seconds="$3"
+  local backend=""
+
+  backend="$(review_queue_backend)"
+  case "$backend" in
+    core)
+      core_lease_work "$repo_root" "$lease_run_id" "$lease_seconds"
+      ;;
+    *)
+      emit_review_queue_metric "$repo_root" "backend-unavailable" "unknown" "" "" "lease" "unknown-backend:$(review_queue_unknown_backend_token)"
+      die "unknown REVHARNESS_REVIEW_QUEUE_BACKEND: $(review_queue_unknown_backend_token)"
+      ;;
+  esac
+}
+
+core_finalize_work() {
+  local action="$1"
+  local repo_root="$2"
+  local lease_owner="$3"
+  local lease_run_id="$4"
+  local error_message="$5"
+  local requested_project_id="$6"
+  shift 6
+  local expected_files=("$@")
+  local normalized_expected_files=()
+  local project_id=""
+  local now=""
+  local snapshot=""
+  local expected_json=""
+  local matched_items_json=""
+  local matched_count=""
+  local expected_count=""
+  local op=""
+  local event_json=""
+  local output_json=""
+
+  [[ "$action" == "complete" || "$action" == "requeue" ]] || die "unsupported finalize action: $action"
+  [[ -n "$lease_owner" ]] || die "$action requires --lease-owner"
+  [[ "${#expected_files[@]}" -gt 0 ]] || die "$action requires at least one --expected-file"
+  lease_owner="$(validate_queue_lease_owner "$lease_owner")"
+  lease_run_id="$(validate_optional_queue_lease_run_id "$lease_run_id")"
+  for file_path in "${expected_files[@]}"; do
+    normalized_expected_files+=("$(canonicalize_queue_enqueue_file_path "$repo_root" "$file_path")")
+  done
+  if [[ "$action" == "requeue" ]]; then
+    [[ -n "$error_message" ]] || die "requeue requires --error"
+  fi
+
+  project_id="$(resolve_effective_project_id "$repo_root" "$requested_project_id")" \
+    || die "failed to resolve effective project_id for repo: $repo_root"
+  core_queue_enter_or_die "$repo_root" "$project_id" "" "$action"
+  now="$(utc_now)"
+  expected_json="$(json_array_from_args "${normalized_expected_files[@]}")"
+  snapshot="$(core_queue_snapshot_json "$repo_root" "$project_id" "$now")"
+  matched_items_json="$(
+    "$RESOLVED_JQ" -c \
+      --arg owner "$lease_owner" \
+      --arg run_id "$lease_run_id" \
+      --argjson expected "$expected_json" \
+      '[.items[]
+        | select((.file_path as $f | $expected | index($f)) != null)
+        | select(.queue_state == "leased")
+        | select(.lease_owner == $owner)
+        | select(if $run_id == "" then ((.lease_run_id // "") == "") else (.lease_run_id == $run_id) end)]' <<< "$snapshot"
+  )"
+  matched_count="$("$RESOLVED_JQ" -r 'length' <<< "$matched_items_json")"
+  expected_count="$("$RESOLVED_JQ" -r 'length' <<< "$expected_json")"
+  if [[ "$matched_count" != "$expected_count" ]]; then
+    core_queue_release_lock
+    die "$action failed: expected files are not all leased by owner"
+  fi
+
+  if [[ "$action" == "complete" ]]; then
+    op="complete"
+    event_json="$(
+      "$RESOLVED_JQ" -nc --arg project_id "$project_id" --arg owner "$lease_owner" --arg run_id "$lease_run_id" --arg at "$now" --argjson items "$expected_json" \
+        '{schema_version:1, op:"complete", project_id:$project_id, lease_owner:$owner, lease_run_id:$run_id, completed_at:$at, items:$items}'
+    )"
+    core_queue_append_event "$repo_root" "$event_json"
+    output_json="$(
+      "$RESOLVED_JQ" -nc --arg project_id "$project_id" --arg owner "$lease_owner" --arg at "$now" --argjson items "$matched_items_json" \
+        '{project_id:$project_id, lease_owner:$owner, completed_at:$at, completed_count:($items|length), items:($items|map(.queue_state="done"|.acknowledged_at=$at|.lease_expires_at=null|del(.lease_run_id)))}'
+    )"
+  else
+    op="requeue"
+    event_json="$(
+      "$RESOLVED_JQ" -nc --arg project_id "$project_id" --arg owner "$lease_owner" --arg run_id "$lease_run_id" --arg at "$now" --arg error "$error_message" --argjson items "$expected_json" \
+        '{schema_version:1, op:"requeue", project_id:$project_id, lease_owner:$owner, lease_run_id:$run_id, requeued_at:$at, error:$error, items:$items}'
+    )"
+    core_queue_append_event "$repo_root" "$event_json"
+    output_json="$(
+      "$RESOLVED_JQ" -nc --arg project_id "$project_id" --arg owner "$lease_owner" --arg at "$now" --arg error "$error_message" --argjson items "$matched_items_json" \
+        '{project_id:$project_id, lease_owner:$owner, requeued_at:$at, requeued_count:($items|length), items:($items|map(.queue_state="pending"|.lease_owner=null|.lease_run_id=null|.leased_at=null|.lease_expires_at=null|.last_error=$error|del(.lease_run_id)))}'
+    )"
+  fi
+  [[ -n "$op" ]] || die "invalid finalize operation"
+  core_queue_release_lock
+  printf '%s\n' "$output_json"
+}
+
+finalize_work() {
+  local action="$1"
+  local repo_root="$2"
+  local lease_owner="$3"
+  local lease_run_id="$4"
+  local error_message="$5"
+  local requested_project_id="$6"
+  shift 6
+  local expected_files=("$@")
+  local backend=""
+
+  backend="$(review_queue_backend)"
+  case "$backend" in
+    core)
+      core_finalize_work "$action" "$repo_root" "$lease_owner" "$lease_run_id" "$error_message" "$requested_project_id" "${expected_files[@]}"
+      ;;
+    *)
+      emit_review_queue_metric "$repo_root" "backend-unavailable" "unknown" "" "" "$action" "unknown-backend:$(review_queue_unknown_backend_token)"
+      die "unknown REVHARNESS_REVIEW_QUEUE_BACKEND: $(review_queue_unknown_backend_token)"
+      ;;
+  esac
+}
+
+core_export_queue_json() {
+  local repo_root="$1"
+  local requested_project_id="$2"
+  local output_path="$3"
+  local project_id=""
+  local snapshot=""
+  local output_dir=""
+
+  [[ -n "$output_path" ]] || die "export-json requires --output"
+  project_id="$(resolve_effective_project_id "$repo_root" "$requested_project_id")" \
+    || die "failed to resolve effective project_id for repo: $repo_root"
+  core_queue_enter_or_die "$repo_root" "$project_id" "" "export-json"
+  snapshot="$(core_queue_snapshot_json "$repo_root" "$project_id" "$(utc_now)")"
+  output_dir="$(path_parent_dir "$output_path")"
+  mkdir -p "$output_dir" || die "failed to create queue export directory: $output_dir"
+  core_queue_public_snapshot_json <<< "$snapshot" > "$output_path" || die "failed to write queue export: $output_path"
+  core_queue_release_lock
+  "$RESOLVED_JQ" -nc --arg project_id "$project_id" --arg output "$output_path" --argjson snapshot "$snapshot" \
+    '{project_id:$project_id, output:$output, pending_count:$snapshot.pending_count, leased_count:$snapshot.leased_count}'
+}
+
+export_queue_json() {
+  local repo_root="$1"
+  local requested_project_id="$2"
+  local output_path="$3"
+  local backend=""
+
+  backend="$(review_queue_backend)"
+  case "$backend" in
+    core)
+      core_export_queue_json "$repo_root" "$requested_project_id" "$output_path"
+      ;;
+    *)
+      emit_review_queue_metric "$repo_root" "backend-unavailable" "unknown" "" "" "export-json" "unknown-backend:$(review_queue_unknown_backend_token)"
+      die "unknown REVHARNESS_REVIEW_QUEUE_BACKEND: $(review_queue_unknown_backend_token)"
+      ;;
+  esac
+}
+
+main() {
+  local command="${1:-}"
+  case "$command" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+
+  # Resolve jq ONCE from a trusted location before any code path can reach a jq
+  # call site. This covers the public commands AND the __internal-* runtime
+  # subcommands (e.g. __internal-runtime-env, which reaches emit_runtime_env_json
+  # -> jq). Skip only -h/--help (handled above, never uses jq).
+  ensure_jq
+
+  case "$command" in
+    __internal-rust-workspace-root)
+      shift || true
+      internal_rust_workspace_root_main "$@"
+      return $?
+      ;;
+    __internal-runtime-env)
+      shift || true
+      internal_runtime_env_main "$@"
+      return 0
+      ;;
+    __internal-run-runtime)
+      shift || true
+      internal_run_runtime_main "$@"
+      return 0
+      ;;
+  esac
+  [[ -n "$command" ]] || {
+    usage >&2
+    exit 1
+  }
+  shift || true
+
+  local repo_root=""
+  repo_root="$(canonicalize_dir "$(script_dir)/..")"
+  local file_path=""
+  local source="manual"
+  local export_json_path=""
+  local lease_run_id=""
+  local lease_seconds=""
+  local lease_owner=""
+  local error_message=""
+  local requested_project_id=""
+  local expected_files=()
+  local seen_flags=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo-root)
+        [[ $# -ge 2 ]] || die "--repo-root requires a value"
+        seen_flags+=("$1")
+        repo_root="$(canonicalize_dir "$2")"
+        shift 2
+        ;;
+      --file-path)
+        [[ $# -ge 2 ]] || die "--file-path requires a value"
+        seen_flags+=("$1")
+        file_path="$2"
+        shift 2
+        ;;
+      --source)
+        [[ $# -ge 2 ]] || die "--source requires a value"
+        seen_flags+=("$1")
+        source="$2"
+        shift 2
+        ;;
+      --export-json)
+        [[ $# -ge 2 ]] || die "--export-json requires a value"
+        seen_flags+=("$1")
+        export_json_path="$2"
+        shift 2
+        ;;
+      --output)
+        [[ $# -ge 2 ]] || die "--output requires a value"
+        seen_flags+=("$1")
+        export_json_path="$2"
+        shift 2
+        ;;
+      --lease-run-id)
+        [[ $# -ge 2 ]] || die "--lease-run-id requires a value"
+        seen_flags+=("$1")
+        lease_run_id="$2"
+        shift 2
+        ;;
+      --lease-seconds)
+        [[ $# -ge 2 ]] || die "--lease-seconds requires a value"
+        seen_flags+=("$1")
+        lease_seconds="$2"
+        shift 2
+        ;;
+      --lease-owner)
+        [[ $# -ge 2 ]] || die "--lease-owner requires a value"
+        seen_flags+=("$1")
+        lease_owner="$2"
+        shift 2
+        ;;
+      --error)
+        [[ $# -ge 2 ]] || die "--error requires a value"
+        seen_flags+=("$1")
+        error_message="$2"
+        shift 2
+        ;;
+      --project-id)
+        [[ $# -ge 2 ]] || die "--project-id requires a value"
+        seen_flags+=("$1")
+        requested_project_id="$2"
+        shift 2
+        ;;
+      --expected-file)
+        [[ $# -ge 2 ]] || die "--expected-file requires a value"
+        seen_flags+=("$1")
+        expected_files+=("$2")
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1"
+        ;;
+      esac
+  done
+
+  validate_command_flags "$command" "${seen_flags[@]}"
+
+  case "$command" in
+    enqueue)
+      enqueue_file "$repo_root" "$file_path" "$source" "$export_json_path"
+      ;;
+    lease|drain)
+      lease_work "$repo_root" "$lease_run_id" "${lease_seconds:-900}"
+      ;;
+    complete)
+      finalize_work "complete" "$repo_root" "$lease_owner" "$lease_run_id" "" "$requested_project_id" "${expected_files[@]}"
+      ;;
+    requeue)
+      finalize_work "requeue" "$repo_root" "$lease_owner" "$lease_run_id" "$error_message" "$requested_project_id" "${expected_files[@]}"
+      ;;
+    export-json)
+      export_queue_json "$repo_root" "$requested_project_id" "$export_json_path"
+      ;;
+    *)
+      usage >&2
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

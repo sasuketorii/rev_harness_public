@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revharness.local/schemas/path_leak_events.jsonl.schema.json",
+  "title": "path_leak_events.jsonl row",
+  "description": "One row per detected home-path leak attempt. Privacy invariant: the raw leaked path itself is redacted before logging.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "event",
+    "source",
+    "match_count",
+    "redacted_preview",
+    "action"
+  ],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event": {
+      "type": "string",
+      "enum": ["path_leak"]
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Relative path of the artifact where the leak was detected."
+    },
+    "match_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "redacted_preview": {
+      "type": "string",
+      "description": "Redacted preview of the leaked content."
+    },
+    "action": {
+      "type": "string",
+      "enum": ["redact", "block", "warn"]
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent_family": {
+      "type": "string",
+      "enum": ["claude", "codex", "unknown"]
+    },
+    "hook": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

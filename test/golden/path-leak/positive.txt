@@ -1,0 +1,5 @@
+P1 macOS dev path: /Users/alice/dev/rev_harness/src/lib.rs # rev-harness-path-leak-guard: allow
+P2 Linux dev path: /home/alice/dev/rev_harness/src/lib.rs # rev-harness-path-leak-guard: allow
+P3 host-specific literal shape without current host user: /Users/sample-user/dev/rev_harness/AGENTS.md # rev-harness-path-leak-guard: allow
+P4 Cargo output: Compiling rev_harness v0.1.0 (/Users/alice/dev/rev_harness/crates/harness) # rev-harness-path-leak-guard: allow
+P5 runtime log: ERROR failed to open /home/alice/dev/rev_harness/tmp/state.json # rev-harness-path-leak-guard: allow

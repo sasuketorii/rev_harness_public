@@ -1,0 +1,83 @@
+name: Harness CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ "main", "develop", "codex/**" ]
+  pull_request:
+    branches: [ "main", "develop", "codex/**" ]
+  workflow_dispatch:
+    inputs:
+      gate_tier:
+        description: "Harness gate tier to run"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - quick
+          - local
+          - full
+      live_cross_family_smoke:
+        description: "Run opt-in live Codex -> Opus artifact smoke on this runner"
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  harness-release-gate:
+    name: Harness Release Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # scripts/_canonical-guard.sh defaults to requiring $HOME/dev/rev_harness
+      # as the canonical root. On a CI runner the checkout path never matches
+      # that, so set REV_HARNESS_CANONICAL_ROOT explicitly to github.workspace
+      # to avoid a false "vendored copy" rejection (exit 70).
+      REV_HARNESS_CANONICAL_ROOT: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Node.js is provisioned only as a generic trusted runtime (some harness
+      # tooling resolves a `node` binary). There is no npm dependency tree to
+      # cache or install here.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Run authoritative harness gate
+        env:
+          HARNESS_CI_GATE_TIER: ${{ inputs.gate_tier || 'full' }}
+        run: bash test/integration/harness_release_gate.sh --tier "$HARNESS_CI_GATE_TIER"
+
+      - name: Run opt-in live cross-family smoke
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.live_cross_family_smoke }}
+        run: bash scripts/cross-family-live-artifact-smoke.sh --json
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-release-gate-artifacts
+          path: .claude/tmp/harness-release-gate/
+          if-no-files-found: warn
+
+      - name: Upload live smoke artifacts
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.live_cross_family_smoke }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-family-live-smoke-artifacts
+          path: .claude/tmp/cross-family-live-smoke-*/
+          if-no-files-found: warn

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revharness.local/schemas/hook_timeout.jsonl.schema.json",
+  "title": "hook_timeout.jsonl row",
+  "description": "One row per hook phase that timed out or otherwise dispatched its fail-open ERR trap. Emitted by __gsd_emit_timeout_row.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "hook", "phase", "elapsed_ms", "exit_code"],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "hook": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "exit_code": {
+      "type": "integer"
+    }
+  }
+}

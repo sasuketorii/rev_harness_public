@@ -1,0 +1,19 @@
+# Pins the Rust toolchain used to build harness-rust/.
+#
+# MSRV rationale (evidence-based, checked 2026-08-19):
+#   `cargo metadata --format-version 1` was cross-referenced against the
+#   actual host-target dependency graph (`cargo tree --target <host> -e
+#   normal,build`) for this workspace. The highest `rust-version` declared by
+#   any crate actually compiled for a normal host build (not wasm/windows-only
+#   transitive deps) is 1.85 (clap 4.6.1, getrandom 0.4.2 via uuid's "v4"
+#   feature, uuid 1.23.1). That alone was NOT sufficient in practice:
+#   `cargo +1.85.0 check --workspace` and `cargo +1.86.0 check --workspace`
+#   both failed to compile crates/agent-core/src/session/timeout.rs, which
+#   calls the unsigned-integer `is_multiple_of` method
+#   (https://github.com/rust-lang/rust/issues/128101). That method was
+#   stabilized in Rust 1.87.0. `cargo +1.87.0 check --workspace` succeeded.
+#   1.87.0 is therefore the minimum supported Rust version (MSRV) for this
+#   workspace; see `rust-version` in each crate's Cargo.toml.
+[toolchain]
+channel = "1.87.0"
+components = ["rustfmt", "clippy"]

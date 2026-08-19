@@ -1,0 +1,303 @@
+{
+  "schema_version": "codex-model-policy/v1",
+  "_comment_model_ids": "current_model/stable_default_model/minimum_allowed_model are the harness maintainer's DEFAULT baseline, verified as of the entries in official_sources below. These are real model ids at the time they were verified but they WILL age out and may not be available on every adopter's account/plan. Adopters should override the effective Codex model per-invocation via the REV_HARNESS_CODEX_MODEL environment variable (see scripts/codex-wrapper.sh --help) instead of editing this file. Overriding does not bypass the fail-closed minimum-model gate: runtime_fallback_below_minimum stays 'forbidden' and scripts/codex-wrapper.sh re-ranks any REV_HARNESS_CODEX_MODEL value against minimum_allowed_model, dying before invoking codex if the override ranks below the minimum.",
+  "override_env_vars": {
+    "codex_model": "REV_HARNESS_CODEX_MODEL"
+  },
+  "lane_tier_model_intent": {
+    "_purpose": "Design intent for which lanes get the strongest available model vs. the fastest available model, per agent family. Heavy-judgment lanes (planning, review, acceptance) route to the strongest model; implementation/documentation lanes route to a faster model. Only the codex_model_id values under heavy_tier are wired into this file's own fail-closed gate today (current_model/minimum_allowed_model, enforced by scripts/codex-wrapper.sh and scripts/model-policy.sh). claude_model_id values are informational cross-reference only: Claude Code's own model selection is configured outside this Codex-only policy file (see .claude/CLAUDE-LOCAL.md), and this JSON cannot select a Claude model.",
+    "heavy_tier": {
+      "roles": [
+        "reviewer",
+        "security_reviewer",
+        "system_planner",
+        "plan_reviewer",
+        "stack_upgrade_reviewer"
+      ],
+      "used_for": "orchestrator / secure-reviewer: plan acceptance, security review, final release gating",
+      "codex_model_id": "gpt-5.6-sol",
+      "codex_model_id_status": "confirmed: matches current_model/stable_default_model above, evidenced in official_sources below",
+      "claude_model_id": "claude-fable-5",
+      "claude_model_id_status": "confirmed: used as an active independent-family reviewer identity in this repository's review history (e.g. .agent/active/idxfirst-20260611/p1/review_fable_r1.md)"
+    },
+    "light_tier": {
+      "roles": [
+        "standard",
+        "coder"
+      ],
+      "used_for": "worker / documentation: implementation slices, docs, low-risk edits",
+      "codex_model_id_status": "confirmed by direct probe on 2026-08-19: `gpt-5.6-luna` responds and accepts model_reasoning_effort=max. Note that `gpt-5.6-luna-max` / `gpt-5.6-lunamax` are NOT model ids -- probing them returns 'not supported when using Codex with a ChatGPT account'. The intended configuration is the model id `gpt-5.6-luna` combined with reasoning effort `max`, not a fused identifier. Model availability is account- and plan-dependent, so verify on your own account before relying on it; override per-invocation with REV_HARNESS_CODEX_MODEL rather than editing this file. The minimum_allowed_model fail-closed gate still applies to any override.",
+      "claude_model_id": "claude-sonnet-5",
+      "claude_model_id_status": "confirmed",
+      "codex_model_id": "gpt-5.6-luna",
+      "codex_reasoning_effort": "max"
+    }
+  },
+  "current_model": "gpt-5.6-sol",
+  "stable_default_model": "gpt-5.6-sol",
+  "minimum_allowed_model": "gpt-5.5",
+  "candidate_model": null,
+  "previous_model": "gpt-5.5",
+  "model_order": [
+    "gpt-5.4",
+    "gpt-5.5",
+    "gpt-5.6-sol"
+  ],
+  "runtime_fallback_below_minimum": "forbidden",
+  "roles": {
+    "standard": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached"
+    },
+    "research": {
+      "model_reasoning_effort": "high",
+      "web_search": "live"
+    },
+    "coder": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached"
+    },
+    "high-coder": {
+      "model_reasoning_effort": "high",
+      "web_search": "cached"
+    },
+    "reviewer": {
+      "model_reasoning_effort": "xhigh",
+      "web_search": "cached"
+    }
+  },
+  "native_agent_presets": {
+    "model": "gpt-5.6-sol",
+    "allowed_efforts": [
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "medium_effort_agents": [
+      "alternative_reviewer",
+      "coder",
+      "consistency_reviewer",
+      "performance_reviewer"
+    ],
+    "high_effort_agents": [
+      "stack_upgrade_researcher"
+    ],
+    "xhigh_effort_agents": [
+      "plan_reviewer",
+      "security_reviewer",
+      "stack_upgrade_reviewer",
+      "system_planner"
+    ],
+    "lane_requirements": {
+      "performance_reviewer": {
+        "deterministic_benchmark_or_check_required": true
+      },
+      "initial_execplan_design": {
+        "model_reasoning_effort": "xhigh",
+        "web_search": "cached",
+        "applies_to": [
+          "initial design before ExecPlan approval",
+          "ExecPlan drafting for mutation-authorizing work",
+          "ExecPlan review planning before coder slice execution"
+        ],
+        "native_agent_presets": [
+          "system_planner",
+          "plan_reviewer"
+        ],
+        "boundary": "This is separate from ordinary docs-only or light plan formatting; do not downgrade initial ExecPlan design to medium."
+      }
+    },
+    "compatibility_notes": [
+      "repo-local config uses features.multi_agent only",
+      "features.multi_agent_v2 and agents.max_threads are forbidden until explicitly migrated"
+    ]
+  },
+  "routing_lanes": {
+    "default_standard_light_coder": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached",
+      "entrypoint": "scripts/codex-wrapper.sh --role standard"
+    },
+    "normal_coder": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached",
+      "entrypoint": "scripts/codex-wrapper.sh --role coder"
+    },
+    "complex_coder": {
+      "model_reasoning_effort": "high",
+      "web_search": "cached",
+      "entrypoint": "scripts/codex-wrapper.sh --role high-coder"
+    },
+    "consistency_reviewer_normal": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached",
+      "entrypoint": ".codex/agents/consistency_reviewer.toml"
+    },
+    "performance_reviewer_normal": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached",
+      "deterministic_benchmark_or_check_required": true,
+      "entrypoint": ".codex/agents/performance_reviewer.toml"
+    },
+    "alternative_reviewer_normal": {
+      "model_reasoning_effort": "medium",
+      "web_search": "cached",
+      "entrypoint": ".codex/agents/alternative_reviewer.toml"
+    },
+    "alternative_reviewer_comparative_high_risk": {
+      "model_reasoning_effort": "high",
+      "web_search": "cached",
+      "entrypoint": "native high-effort escalation"
+    },
+    "security_reviewer": {
+      "model_reasoning_effort": "xhigh",
+      "web_search": "cached",
+      "entrypoint": ".codex/agents/security_reviewer.toml"
+    },
+    "final_release_truth_wrapper_model_policy_reviewer": {
+      "model_reasoning_effort": "xhigh",
+      "web_search": "cached",
+      "entrypoint": "scripts/codex-wrapper.sh --role reviewer"
+    },
+    "research": {
+      "model_reasoning_effort": "high",
+      "web_search": "live",
+      "entrypoint": "scripts/codex-wrapper.sh --role research"
+    },
+    "initial_execplan_design": {
+      "model_reasoning_effort": "xhigh",
+      "web_search": "cached",
+      "entrypoint": "native Codex system_planner / plan_reviewer preset",
+      "applies_to": "first design / ExecPlan drafting / ExecPlan review planning before mutation-authorizing slice execution",
+      "boundary": "Not used for routine docs-only/light planning or bookkeeping."
+    }
+  },
+  "official_sources": [
+    {
+      "url": "https://developers.openai.com/codex/models",
+      "checked_at": "2026-04-25",
+      "accepted_fact": "gpt-5.5 was OpenAI's newest listed frontier model for Codex as of this checked date (2026-04-25); a newer model, gpt-5.6-sol, was subsequently verified (see the official_sources entry below checked 2026-07-13).",
+      "verified_model_ids": [
+        "gpt-5.5",
+        "gpt-5.4"
+      ]
+    },
+    {
+      "url": "https://platform.openai.com/docs/models/gpt-5.6-sol",
+      "checked_at": "2026-07-13",
+      "accepted_fact": "Official evidence contains exact candidate model id gpt-5.6-sol with Codex/API availability or compatibility context.",
+      "verified_model_ids": [
+        "gpt-5.6-sol"
+      ]
+    }
+  ],
+  "official_source_rules": {
+    "accepted_url_prefixes": [
+      "https://developers.openai.com/codex/",
+      "https://platform.openai.com/",
+      "https://openai.com/"
+    ],
+    "candidate_registration_requires": [
+      "official OpenAI or Codex URL",
+      "exact candidate model id in source content",
+      "availability or compatibility context for Codex, API, CLI, SDK, app, or IDE extension",
+      "non-fixture evidence"
+    ],
+    "fixture_evidence": "forbidden"
+  },
+  "review_round_policy": {
+    "schema_note": "Canonical machine-readable cap on rereview ROUNDS for low-risk slices. This caps the fix-and-rereview loop count only; it never relaxes I-12 smoke-gated dual-LGTM (two agent families are always required for phase advance).",
+    "default_max_passes": 2,
+    "default_passes_explanation": "One initial review (R1) plus one Conditional-resolution rereview. Applies to low-risk classes such as docs-only, test-fix, and local-rename.",
+    "ceremony_classifier": "scripts/rev-harness-task-classifier.sh",
+    "ceremony_tier_alignment": "The canonical classifier's task_class (light/standard/heavy) is the SINGLE ceremony tier (see docs/manual/matrix-vocabulary.json task_class.ceremony_mapping). `light` fast-paths contract validation + single-family review; `standard` requires scoped reviewer signoff; `heavy` requires dual-family review + final release gate. This round cap is orthogonal to the tier: it caps rereview ROUNDS only and applies to low-risk tiers; it NEVER lets a `heavy` tier skip dual-LGTM, I-12 smoke, or contract validation.",
+    "risk_exempt_classes": [
+      "design",
+      "acceptance-gate",
+      "security",
+      "wrapper",
+      "semantic-change",
+      "broad-refactor"
+    ],
+    "risk_exempt_explanation": "Risk-exempt classes MAY exceed default_max_passes because multi-round review on these surfaces is load-bearing. The cap is advisory for these classes, not a forced stop. These surfaces map to the canonical classifier's `heavy` tier (full ceremony).",
+    "dual_lgtm_invariant": "I-12 (smoke-gated dual-LGTM, two families for phase advance) is UNCHANGED by this policy. The cap governs rereview rounds within a family/loop, never the cross-family requirement. No `heavy` ceremony tier can skip dual-LGTM, I-12 smoke, or contract validation.",
+    "authority": "docs/manual/verification-truth-matrix.md"
+  },
+  "generated_artifact": {
+    "path": ".agent/generated/codex_model_policy.runtime.json",
+    "generated_at": "2026-04-25T00:00:00Z"
+  },
+  "blocked_overrides": {
+    "config_keys": [
+      "model",
+      "model_provider",
+      "model_reasoning_effort",
+      "sandbox_mode",
+      "approval_policy",
+      "web_search",
+      "web_search_cached",
+      "features.web_search_cached",
+      "features.web_search_request",
+      "features.multi_agent_v2",
+      "agents.max_threads"
+    ],
+    "feature_flags": [
+      "web_search_cached",
+      "web_search_request",
+      "multi_agent_v2",
+      "multi_agent"
+    ],
+    "options": [
+      "--model",
+      "-m",
+      "--sandbox",
+      "-s",
+      "--ask-for-approval",
+      "-a",
+      "--profile",
+      "-p",
+      "--local-provider",
+      "--cd",
+      "--add-dir",
+      "--search",
+      "--full-auto",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--oss"
+    ]
+  },
+  "native_config_guards": {
+    "required_features_multi_agent": true,
+    "forbidden_features": [
+      "multi_agent_v2"
+    ],
+    "forbidden_config_keys": [
+      "agents.max_threads"
+    ]
+  },
+  "strict_runtime_surfaces": [
+    "scripts/codex-wrapper.sh",
+    ".agent/generated/codex_model_policy.runtime.json",
+    ".codex/config.toml",
+    ".codex/agents/*.toml",
+    "setup/bootstrap.sh",
+    "test/integration/*.sh",
+    "AGENTS.md",
+    ".agent_rules/RULES.md",
+    "docs/roles/*.md",
+    "docs/manual/*.md",
+    "docs/generated/*.md"
+  ],
+  "historical_allow_paths": [
+    ".agent/archive/**",
+    ".agent/active/prompts/**",
+    ".claude/tmp/**",
+    "*.log",
+    "log.txt"
+  ],
+  "stale_ref_classification_rules": {
+    "strict_runtime_surface": "old real model ids below minimum, unapproved candidates, and generated mirror drift are BLOCK unless explicitly marked as a negative example",
+    "negative_examples": "allowed only under labels such as example_forbidden_model, forbidden, blocked override, negative, or expected FAIL",
+    "historical_archive_log": "archive, prompt outputs, and logs are ALLOW-HISTORICAL",
+    "active_imperative": ".agent/active imperative runtime instructions below minimum are BLOCK; provenance, review reports, official-source notes, and planning text are WARN or ALLOW-NEGATIVE-EXAMPLE"
+  }
+}

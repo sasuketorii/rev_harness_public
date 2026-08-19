@@ -1,0 +1,40 @@
+{
+  "schema_version": "rev-harness-distribution-adoption-prerequisites/v1",
+  "packet_status": "informational: prerequisites that an adopter checkout must satisfy before scripts/rev-harness-distribution-adoption.sh --check can be cited as acceptance evidence. Nothing in the checker reads this field; it exists to document, for a human reader, why a freshly cloned distribution does not pass the check out of the box.",
+  "non_claims": {
+    "lgtm": false,
+    "acceptance": false,
+    "completion": false,
+    "release_readiness": false,
+    "publish": false,
+    "tag": false,
+    "package": false
+  },
+  "prerequisites": [
+    {
+      "name": "dirty surface manifest",
+      "status": "deferred",
+      "reason": "A clean distribution does not ship active-development manifests. This is a per-task artifact regenerated locally once an adopter starts doing work in their own checkout."
+    },
+    {
+      "name": "evidence manifest",
+      "status": "deferred",
+      "reason": "A clean distribution does not ship active-development manifests. This is a per-task artifact regenerated locally once an adopter starts doing work in their own checkout."
+    },
+    {
+      "name": "worker lifecycle manifest",
+      "status": "deferred",
+      "reason": "A clean distribution does not ship active-development manifests. This is a per-task artifact regenerated locally once an adopter starts doing work in their own checkout."
+    },
+    {
+      "name": "counter admission preflight",
+      "status": "deferred",
+      "reason": "Admission/counter gating is a source-repository development-process concept used while this harness is being developed on itself. It has no meaning for a packaged distribution tree and is not evaluated here."
+    },
+    {
+      "name": "schema-micro-fix admission",
+      "status": "deferred",
+      "reason": "Admission classification (e.g. schema-micro-fix vs. full change) is a source-repository development-process concept used while this harness is being developed on itself. It has no meaning for a packaged distribution tree and is not evaluated here."
+    }
+  ]
+}

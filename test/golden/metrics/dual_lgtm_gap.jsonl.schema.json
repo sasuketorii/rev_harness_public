@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revharness.local/schemas/dual_lgtm_gap.jsonl.schema.json",
+  "title": "dual_lgtm_gap.jsonl row",
+  "description": "One row per detected dual-LGTM verdict gap (e.g. only one reviewer reported, conditional LGTM unresolved, or wip: commit included in evaluable set).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "event",
+    "task_id",
+    "gap_kind",
+    "reviewers_seen",
+    "reviewers_required"
+  ],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event": {
+      "type": "string",
+      "enum": ["dual_lgtm_gap"]
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gap_kind": {
+      "type": "string",
+      "enum": [
+        "missing_reviewer",
+        "conditional_unresolved",
+        "wip_commit_included",
+        "verdict_mismatch",
+        "stale_review"
+      ]
+    },
+    "reviewers_seen": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "reviewers_required": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "verdicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reviewer_id", "verdict"],
+        "properties": {
+          "reviewer_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "verdict": {
+            "type": "string",
+            "enum": ["lgtm", "conditional", "rejected", "absent"]
+          },
+          "ts": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "evaluable_commits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "wip_commits_excluded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "agent_family": {
+      "type": "string",
+      "enum": ["claude", "codex", "unknown"]
+    }
+  }
+}

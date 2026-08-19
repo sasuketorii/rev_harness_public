@@ -1,0 +1,3 @@
+{"schema_version":"rev-harness-build-cleanup/v1","ts":"2026-05-25T12:30:00Z","event":"build_cleanup","mode":"dry_run","target_count":0,"freed_bytes":0,"protected_skipped":0,"age_threshold_days":14,"ts_oldest_deleted":null}
+{"schema_version":"rev-harness-build-cleanup/v1","ts":"2026-05-25T12:30:05Z","event":"build_cleanup","mode":"apply","target_count":1,"freed_bytes":1048576,"protected_skipped":1,"age_threshold_days":14,"ts_oldest_deleted":"2026-04-25T00:00:00Z"}
+{"schema_version":"rev-harness-build-cleanup/v1","ts":"2026-05-25T12:30:10Z","event":"build_cleanup","mode":"plan","target_count":0,"freed_bytes":0,"protected_skipped":0,"age_threshold_days":14,"ts_oldest_deleted":null}

@@ -1,0 +1,48 @@
+[package]
+name = "agent-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+description = "Core orchestration engine for rev_harness"
+
+[dependencies]
+shared = { path = "../shared" }
+harness-cache = { path = "../harness-cache" }
+rusqlite = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Date/time and identifiers
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# File locking
+fs2 = { workspace = true }
+
+# Temp files
+tempfile = { workspace = true }
+
+# Regex (for jq path validation)
+regex = { workspace = true }
+
+# Hashing (context + capsule modules)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
+
+[features]
+default = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

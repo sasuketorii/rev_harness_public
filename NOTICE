@@ -1,0 +1,21 @@
+Revharness
+Copyright 2026 Sasuke Torii
+
+This product includes software developed by Sasuke Torii and the
+Revharness contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+A copy of the License is available in the LICENSE file at the root
+of this distribution, and at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This distribution may execute third-party command-line tools (for
+example, git, jq, and provider CLIs such as Codex, Claude Code, and
+Cursor) as separate processes. Those tools are not bundled with this
+distribution, are not modified by it, and remain governed by their own
+respective licenses and terms of service. Rust crate dependencies used
+by harness-rust/ are likewise governed by their own upstream licenses;
+see harness-rust/Cargo.lock and each crate's published license for
+details.

@@ -1,0 +1,3 @@
+{"schema":"adopter_setup/v1","event":"phase_start","run_id":"20260525T121036Z","phase":"init","status":"running","exit_code":0,"input_sha256":"128c2ffcdcb77cb50eff9ad4d8b3d4ccb85ebcad98c6cf2c69c55b646a7963ae","ts":"2026-05-25T12:10:36Z"}
+{"schema":"adopter_setup/v1","event":"phase_end","run_id":"20260525T121036Z","phase":"init","status":"ok","exit_code":0,"input_sha256":"128c2ffcdcb77cb50eff9ad4d8b3d4ccb85ebcad98c6cf2c69c55b646a7963ae","ts":"2026-05-25T12:10:36Z"}
+{"schema":"adopter_setup/v1","event":"run_summary","run_id":"20260525T121036Z","phase":"done","status":"ok","exit_code":0,"input_sha256":"","ts":"2026-05-25T12:10:37Z"}

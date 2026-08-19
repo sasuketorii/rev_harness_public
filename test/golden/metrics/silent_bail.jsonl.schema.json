@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://revharness.local/schemas/silent_bail.jsonl.schema.json",
+  "title": "silent_bail.jsonl row",
+  "description": "One row per agent run that exited via the graceful-shutdown hook bail path. Emitted by gsd_emit_silent_bail in .claude/hooks/agent-graceful-shutdown.sh. recovery.reaped_pids is a scalar integer (matches the emitter and the test/unit/fixtures/silent_bail_row.json golden fixture).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "event",
+    "task_id",
+    "phase",
+    "elapsed_sec",
+    "recovery",
+    "agent_family"
+  ],
+  "properties": {
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp, e.g. 2026-05-25T00:00:00Z."
+    },
+    "event": {
+      "type": "string",
+      "enum": ["silent_bail"]
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Sanitized REVHARNESS_TASK_ID, [A-Za-z0-9._-]+ or 'unknown'."
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "dirty_exit",
+        "wallclock_hardstop",
+        "sigterm_received",
+        "other"
+      ]
+    },
+    "elapsed_sec": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stash_ref", "bail_branch", "reaped_pids"],
+      "properties": {
+        "stash_ref": {
+          "type": ["string", "null"],
+          "description": "git stash reference (e.g. stash@{0}) or null when no stash was created."
+        },
+        "bail_branch": {
+          "type": ["string", "null"],
+          "description": "Fallback branch name when stash failed; null otherwise."
+        },
+        "reaped_pids": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Scalar count of background PIDs reaped during shutdown."
+        }
+      }
+    },
+    "agent_family": {
+      "type": "string",
+      "enum": ["claude", "codex", "unknown"]
+    }
+  }
+}

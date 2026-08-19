@@ -1,0 +1,76 @@
+name: rust-advisory
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  advisory:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: harness-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare artifact dir
+        run: mkdir -p ../.claude/tmp/cache-rename
+      - name: Record toolchain versions
+        run: |
+          rustc --version | tee ../.claude/tmp/cache-rename/rustc.version
+          cargo --version | tee ../.claude/tmp/cache-rename/cargo.version
+          jq --version | tee ../.claude/tmp/cache-rename/jq.version
+      - name: Install audit tools (pinned)
+        run: |
+          cargo install --locked cargo-audit --version 0.22.1
+          cargo install --locked cargo-deny  --version 0.19.6
+      - name: Prepare metadata
+        run: |
+          mkdir -p target
+          cargo metadata --all-features --locked --format-version 1 \
+            > target/cargo-metadata.json
+      - name: Reject crates.io "cache" reintroduction
+        run: |
+          jq -e '
+            [.packages[] | select(.name == "cache")] | length == 0
+          ' target/cargo-metadata.json
+      - name: Ensure harness-cache is local workspace crate
+        run: |
+          # workspace_members are package id strings like `path+file://.../crates/harness-cache#0.1.0`.
+          # Check exact equality against `$p[0].id`, not a prefix.
+          jq -e '
+            [.packages[] | select(.name == "harness-cache" and .version == "0.1.0")] as $p
+            | ($p | length) == 1
+            and ($p[0].source == null)
+            and ($p[0].manifest_path | endswith("/harness-rust/crates/harness-cache/Cargo.toml"))
+            and ([.workspace_members[] | select(. == $p[0].id)] | length == 1)
+          ' target/cargo-metadata.json
+      - name: Lock-file name gate
+        run: |
+          set -euo pipefail
+          status=0
+          grep -nE '^name = "cache"$' Cargo.lock || status=$?
+          case "$status" in
+            0)
+              echo "::error::crates.io 'cache' package reintroduced in Cargo.lock"
+              exit 1
+              ;;
+            1)
+              : # no-match, gate passes
+              ;;
+            *)
+              echo "::error::Lock-file gate runtime error (grep exit $status)"
+              exit "$status"
+              ;;
+          esac
+      - name: cargo audit
+        run: |
+          cargo audit
+          cargo audit --json | jq -e '(.warnings // []) | length == 0'
+      - name: cargo deny
+        run: cargo deny check advisories sources

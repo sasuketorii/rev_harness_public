@@ -1,0 +1,3 @@
+N1 tilde notation: ~/dev/foo/bar.rs
+N2 placeholder notation: <user>/dev/rev_harness/src/lib.rs
+N3 marker meta-discussion: use # rev-harness-path-leak-guard: allow only for intentional fixture examples.

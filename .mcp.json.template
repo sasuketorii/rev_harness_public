@@ -1,0 +1,9 @@
+{
+  "_README": "Per-machine MCP config template. Copy to .mcp.json and replace placeholders.",
+  "_INSTRUCTIONS": [
+    "1. cp .mcp.json.template .mcp.json",
+    "2. .mcp.json is gitignored (per-machine config)",
+    "3. Core RevHarness ships no default MCP servers; add per-machine servers under mcpServers as needed."
+  ],
+  "mcpServers": {}
+}

@@ -1,0 +1,29 @@
+Usage: codex-wrapper.sh [--role ROLE] [--stdin] [codex args...]
+       codex-wrapper.sh [--role ROLE] --manual-session --resume [SESSION_ID [PROMPT]] [codex args...]
+
+Canonical Codex wrapper for this repository.
+
+Role map:
+  standard  -> medium + cached
+  research  -> high + live
+  coder     -> medium + cached
+  high-coder -> high + cached
+  reviewer  -> xhigh + cached
+
+Notes:
+  - Default role is standard.
+  - Role can be supplied by --role, CODEX_WRAPPER_ROLE, or AGENT_ROLE.
+  - Duplicate --role values merge silently for shim chains; different values
+    fail immediately with the shim source.
+  - Caller overrides for profile, model, reasoning effort, sandbox, approval,
+    web-search, and workspace-expansion controls are blocked.
+  - Normal harness flow is non-interactive. Session continuation is manual-only
+    and requires both --manual-session and a real TTY.
+  - Legacy wrapper scripts are compatibility shims that exec this script.
+  - Codex execution uses up to 2 attempts for transient-only failures:
+    timeout, network/transport errors, or signal-like process death. Exit 144
+    is not retried. Exhausted transient retries exit 75.
+  - Per-attempt timeout is 1800s when gtimeout/timeout is available;
+    if unavailable, timeout is skipped and transient retry remains enabled.
+  - Runtime stderr is caller-owned; harness callers must store it under a
+    run-local stderr/ directory and keep only pointer metadata near outputs.
